@@ -1,0 +1,23 @@
+# Core LLM Proxy & Client Orchestration
+litellm[proxy]>=1.40.0
+openai>=1.20.0
+PyYAML>=6.0.0
+
+# Keystore Encryption & Secret Security
+cryptography>=41.0.0
+
+# Optional Environment Configuration
+python-dotenv>=1.0.0
+
+# Optional Semantic Codebase Embeddings (Lexical & AST indexing is built-in)
+# sentence-transformers>=2.2.0
+
+# Testing & Quality Assurance
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+
+# CLI Interface & Rich Terminal
+rich>=13.0.0
+prompt_toolkit>=3.0.0
+
+pyinstaller

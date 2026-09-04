@@ -1,0 +1,58 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+keystore.dat
+
+# Databases & Runtime State
+*.db
+*.sqlite
+*.sqlite3
+.qazterion/
+.qazterion_*
+*.log
+
+# Python Cache & Build Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE & OS Metadata
+.vscode/
+.idea/
+.cursor/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
