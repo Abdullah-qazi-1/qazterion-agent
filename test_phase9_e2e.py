@@ -45,6 +45,7 @@ class Phase9EndToEndTests(unittest.TestCase):
             source.mkdir()
             tests.mkdir()
             (source / "__init__.py").write_text("", encoding="utf-8")
+            (tests / "__init__.py").write_text("", encoding="utf-8")
             (source / "calculator.py").write_text(
                 "def add(a, b):\n    return a + b\n", encoding="utf-8"
             )

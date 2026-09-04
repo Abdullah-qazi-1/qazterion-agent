@@ -333,7 +333,8 @@ def _impl_run_command(command: str, timeout: int = 60) -> str:
         if result.exit_code and start_directory and "Start directory is not importable" in result.stderr:
             tests_path = start_directory.group(1)
             compatibility_runner = (
-                "import importlib.util, pathlib, unittest; "
+                "import importlib.util, pathlib, sys, unittest; "
+                "sys.path.insert(0, str(pathlib.Path('.').resolve())); "
                 f"root = pathlib.Path(r'{tests_path}'); "
                 "loader = unittest.defaultTestLoader; suite = unittest.TestSuite(); "
                 "[(lambda spec: (lambda module: (spec.loader.exec_module(module), suite.addTests(loader.loadTestsFromModule(module))))(importlib.util.module_from_spec(spec)))(importlib.util.spec_from_file_location(f'_qazterion_test_{i}', path)) "
