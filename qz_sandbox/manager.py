@@ -21,17 +21,20 @@ _manager: SandboxManager | None = None
 
 
 def probe_docker() -> bool:
-    """Return True when ``docker info`` succeeds (daemon reachable)."""
+    """Return True when ``docker info`` succeeds and the daemon runs Linux containers."""
     try:
         completed = subprocess.run(
-            ["docker", "info"],
+            ["docker", "info", "--format", "{{.OSType}}"],
             capture_output=True,
             text=True,
             timeout=8,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return completed.returncode == 0
+    if completed.returncode != 0:
+        return False
+    out = completed.stdout.strip().lower()
+    return out == "linux" or "server version" in out or "linux" in out
 
 
 class SandboxManager:
