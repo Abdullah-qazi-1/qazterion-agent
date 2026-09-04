@@ -368,6 +368,10 @@ class RestrictedHostBackend(ExecutionBackend):
             timeout,
             unsandboxed_reason or "Docker unavailable; command runs on the host",
         )
+        env = dict(os.environ)
+        current_pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = f"{workspace}{os.pathsep}{current_pp}" if current_pp else str(workspace)
+
         try:
             completed = subprocess.run(
                 shell_args,
@@ -376,6 +380,7 @@ class RestrictedHostBackend(ExecutionBackend):
                 text=True,
                 errors="replace",
                 timeout=timeout,
+                env=env,
             )
             return ExecutionResult(
                 stdout=completed.stdout or "",
