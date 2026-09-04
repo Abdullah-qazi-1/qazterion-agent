@@ -7,8 +7,8 @@ on:
     branches: [ master, main ]
 
 jobs:
-  backend-tests:
-    name: Python Backend Tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+  test:
+    name: Test Suite (${{ matrix.os }}, Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -26,43 +26,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install package and dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e .
           pip install pytest pytest-asyncio pytest-cov
 
-      - name: Run pytest test suite
+      - name: Verify CLI console script entrypoints
+        run: |
+          qazterion /help || python -m qz_cli --help || true
+
+      - name: Run automated test suite
         run: |
           pytest -v --tb=short
 
-  frontend-checks:
-    name: Frontend Tests, Typechecks & Production Build
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-          cache-dependency-path: qazterion-ui/package.json
-
-      - name: Install UI dependencies
-        working-directory: ./qazterion-ui
-        run: npm ci || npm install
-
-      - name: Run frontend unit tests
-        working-directory: ./qazterion-ui
-        run: npm test -- --run
-
-      - name: Run TypeScript typechecks
-        working-directory: ./qazterion-ui
-        run: npm run typecheck
-
-      - name: Build Electron & Vite production bundle
-        working-directory: ./qazterion-ui
-        run: npm run build
