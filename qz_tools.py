@@ -302,10 +302,8 @@ def _impl_run_command(command: str, timeout: int = 60) -> str:
         # Host-python rewrite is only valid on the host backend. A Docker
         # container has its own interpreter at /usr/local/bin/python.
         if not using_docker:
-            if _PROJECT_PYTHON and re.match(r"^\s*python(?:\.exe)?(?=\s|$)", command, re.IGNORECASE):
-                interpreter = _PROJECT_PYTHON
-            elif not shutil.which("python") and re.match(r"^\s*python(?:\.exe)?(?=\s|$)", command, re.IGNORECASE):
-                interpreter = sys.executable
+            if re.match(r"^\s*python(?:\.exe)?(?=\s|$)", command, re.IGNORECASE):
+                interpreter = _PROJECT_PYTHON or sys.executable
             else:
                 interpreter = None
             if interpreter:
