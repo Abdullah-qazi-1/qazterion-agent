@@ -1,0 +1,44 @@
+model_list:
+- model_name: groq-fast
+  litellm_params:
+    model: groq/openai/gpt-oss-20b
+    api_key: os.environ/GROQ_KEY_1
+- model_name: coder-backup
+  litellm_params:
+    model: groq/compound-mini
+    api_key: os.environ/GROQ_KEY_1
+- model_name: planner
+  litellm_params:
+    model: mistral/codestral-latest
+    api_key: os.environ/MISTRAL_KEY_1
+- model_name: classify
+  litellm_params:
+    model: gemini/gemini-3.1-flash-lite
+    api_key: os.environ/GEMINI_KEY_1
+- model_name: coder-strong
+  litellm_params:
+    model: mistral/mistral-large-latest
+    api_key: os.environ/MISTRAL_KEY_1
+- model_name: reasoner
+  litellm_params:
+    model: mistral/mistral-medium-3.5
+    api_key: os.environ/MISTRAL_KEY_1
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  allow_requests_on_db_unavailable: true
+router_settings:
+  routing_strategy: least-busy
+  fallbacks:
+  - coder-strong:
+    - groq-fast
+    - coder-backup
+    - reasoner
+  - planner:
+    - groq-fast
+  - reasoner:
+    - groq-fast
+    - coder-backup
+  - classify:
+    - groq-fast
+litellm_settings:
+  drop_params: true
