@@ -34,7 +34,8 @@ def detect_project_environment(path: str | os.PathLike[str]) -> ProjectEnvironme
     python = _interpreter(root); deps = tuple(name for name in ("requirements.txt", "pyproject.toml", "poetry.lock", "Pipfile") if has(name))
     if python or deps or has("setup.py") or has("uv.lock") or has("tox.ini"):
         manager = "poetry" if has("poetry.lock") else "pipenv" if has("Pipfile") else "uv" if has("uv.lock") else "tox" if has("tox.ini") else "pip" if deps else "existing-venv"
-        return ProjectEnvironment(root, "python", manager, python, deps, protected, f"& '{python}' -m pytest" if python else "python -m pytest")
+        test_cmd = (f"& '{python}' -m pytest" if os.name == "nt" else f"'{python}' -m pytest") if python else "python -m pytest"
+        return ProjectEnvironment(root, "python", manager, python, deps, protected, test_cmd)
     for marker, kind, manager, test in (("package.json", "node", "npm", "npm test"), ("Cargo.toml", "rust", "cargo", "cargo test"), ("go.mod", "go", "go", "go test ./..."), ("pom.xml", "java", "maven", "mvn test"), ("build.gradle", "java", "gradle", "gradle test"), ("build.gradle.kts", "java", "gradle", "gradle test")):
         if has(marker): return ProjectEnvironment(root, kind, manager, None, (), protected, test)
     if any(root.glob("*.sln")) or any(root.glob("*.csproj")): return ProjectEnvironment(root, "dotnet", "dotnet", None, (), protected, "dotnet test")
