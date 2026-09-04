@@ -42,6 +42,11 @@ def _reset_global_singletons():
             reset_provider_registry()
         except Exception:
             pass
+        try:
+            from qz_sandbox.manager import reset_manager
+            reset_manager()
+        except Exception:
+            pass
 
     _reset_all()
     yield
