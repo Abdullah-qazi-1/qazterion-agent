@@ -13,6 +13,7 @@ from qz_core.common import _persist_task
 from qz_core.git_ops import generate_commit_message, _commit_hash_from_result
 from qz_core.reviewer import self_review
 from qz_environment import detect_project_environment
+import qz_tools
 from qz_tools import TOOL_SCHEMAS, TOOL_FUNCTIONS, WORKSPACE, commit_changes, run_command
 from qz_usage_tracker import UsageTracker, default_usage_log_path
 from qz_tasks.models import TaskStatus
@@ -234,7 +235,7 @@ def capture_pre_existing_test_failures(workspace: str | None = None) -> TestBase
     agent_mod = sys.modules.get("qz_agent")
     _detect = getattr(agent_mod, "detect_project_environment", detect_project_environment) if agent_mod else detect_project_environment
     _run_cmd = getattr(agent_mod, "run_command", run_command) if agent_mod else run_command
-    _ws = workspace or (getattr(agent_mod, "WORKSPACE", None) if agent_mod else None) or WORKSPACE
+    _ws = workspace or (getattr(agent_mod, "WORKSPACE", None) if agent_mod else None) or qz_tools.WORKSPACE
 
     environment = _detect(_ws)
     if not environment.test_command:
@@ -421,12 +422,12 @@ def run_executor(task: str, plan: str, architecture: str, max_iterations: int = 
     if not task_id:
         try:
             from qz_tasks.task_manager import create_task
-            task_id = create_task(task, WORKSPACE)
+            task_id = create_task(task, qz_tools.WORKSPACE)
         except Exception:
             import uuid
             task_id = str(uuid.uuid4())
 
-    executor = HardDAGExecutor(max_node_iterations=max_iterations)
+    executor = HardDAGExecutor(workspace=qz_tools.WORKSPACE, max_node_iterations=max_iterations)
     result = executor.execute_dag(
         task_id=task_id,
         task_text=task,

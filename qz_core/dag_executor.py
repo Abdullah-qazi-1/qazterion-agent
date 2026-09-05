@@ -39,7 +39,8 @@ from qz_tasks.task_manager import (
     update_status,
     update_subtask_status,
 )
-from qz_tools import TOOL_FUNCTIONS, TOOL_SCHEMAS, WORKSPACE, commit_changes
+import qz_tools
+from qz_tools import TOOL_FUNCTIONS, TOOL_SCHEMAS, commit_changes
 from qz_validation import CheckStatus, ValidationReport
 
 # NOTE ON PATCHING: classify_task_complexity, select_route, request_completion
@@ -158,7 +159,16 @@ class HardDAGExecutor:
         max_node_iterations: int = 15,
         client: OpenAI | None = None,
     ) -> None:
-        self.workspace = Path(workspace or WORKSPACE).resolve()
+        # NOTE: qz_tools.WORKSPACE is read live via the module (qz_tools.WORKSPACE),
+        # not via a `from qz_tools import WORKSPACE` name. A plain name-import
+        # only copies the value once, at the moment this module is first
+        # imported (e.g. during pytest collection) -- it never reflects later
+        # changes, such as a test doing `patch.object(qz_tools, "WORKSPACE", ...)`.
+        # That stale copy previously caused every HardDAGExecutor() built
+        # without an explicit `workspace=` to silently run against whatever
+        # directory was current process-wide at import time (e.g. the real
+        # repo checkout) instead of the caller's intended workspace.
+        self.workspace = Path(workspace or qz_tools.WORKSPACE).resolve()
         self.max_node_retries = max_node_retries
         self.max_node_iterations = max_node_iterations
         self.client = client
