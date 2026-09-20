@@ -36,7 +36,7 @@ class AgentRoutingTests(unittest.TestCase):
         with patch.object(
             qz_agent.client.chat.completions,
             "create",
-            side_effect=[RuntimeError("429 rate limit"), RuntimeError("429 rate limit"), completion()],
+            side_effect=[RuntimeError("429 rate limit"), completion()],
         ) as create:
             _, active = qz_agent.request_completion(
                 model="groq-fast",
@@ -47,7 +47,7 @@ class AgentRoutingTests(unittest.TestCase):
         self.assertEqual(active, "coder-backup")
         self.assertFalse(self.tracker.is_key_eligible("groq-fast"))
         self.assertEqual([call.kwargs["model"] for call in create.call_args_list],
-                         ["groq-fast", "groq-fast", "coder-backup"])
+                         ["groq-fast", "coder-backup"])
 
     def test_quota_error_is_classified_separately(self):
         with patch.object(

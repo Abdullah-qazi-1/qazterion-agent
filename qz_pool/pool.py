@@ -61,7 +61,7 @@ class LLMPool:
         self,
         provider: str,
         request_fn: Callable[[str], Any],
-        max_attempts: int = 2,
+        max_attempts: int | None = None,
     ) -> tuple[Any, str]:
         """Execute a request function using the healthiest available key for a provider.
 
@@ -73,10 +73,11 @@ class LLMPool:
             raise RuntimeError(f"No usable keys available for provider '{provider}'.")
 
         attempts = 0
+        limit = max_attempts if max_attempts is not None else len(candidates)
         last_exception: Exception | None = None
 
         for key_id in candidates:
-            if attempts >= max_attempts:
+            if attempts >= limit:
                 break
             attempts += 1
 

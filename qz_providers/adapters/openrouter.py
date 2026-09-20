@@ -54,7 +54,7 @@ class OpenRouterAdapter(OpenAICompatibleAdapter):
                 capabilities=["chat", "streaming", "reasoning", "large_context"],
                 context_window=64000,
                 max_output_tokens=8192,
-                supports_tools=True,
+                supports_tools=False,
                 supports_streaming=True,
                 supports_reasoning=True,
                 supports_structured_output=True,
@@ -101,9 +101,11 @@ class OpenRouterAdapter(OpenAICompatibleAdapter):
                 modality = str(arch.get("modality", "")).lower() if isinstance(arch, dict) else ""
                 has_vision = "image" in modality or "multimodal" in modality
                 description = str(item.get("description", "")).lower()
-                is_reasoning = "reasoning" in description or "r1" in model_id.lower() or "qwq" in model_id.lower() or "o1" in model_id.lower() or "o3" in model_id.lower()
-
-                caps = ["chat", "streaming", "tool_calling"]
+                is_reasoning = "r1" in model_id.lower() or "reasoner" in model_id.lower() or "reasoning" in description or "thinking" in description
+                caps = ["chat", "streaming"]
+                supports_tools = not is_reasoning or "tool" in description
+                if supports_tools:
+                    caps.append("tool_calling")
                 if is_reasoning:
                     caps.append("reasoning")
                 if has_vision:
@@ -118,7 +120,7 @@ class OpenRouterAdapter(OpenAICompatibleAdapter):
                         display_name=str(item.get("name") or model_id),
                         capabilities=caps,
                         context_window=context_length,
-                        supports_tools=True,
+                        supports_tools=supports_tools,
                         supports_vision=has_vision,
                         supports_streaming=True,
                         supports_reasoning=is_reasoning,

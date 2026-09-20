@@ -102,10 +102,22 @@ class KeyRegistry:
         if api_key.id not in self._keys_by_provider.get(api_key.provider, []):
             self._keys_by_provider.setdefault(api_key.provider, []).append(api_key.id)
 
-    def disable_key(self, key_id: str) -> bool:
-        """Disable a key in memory."""
+    def disable_key(self, key_id: str, persist: bool = True) -> bool:
+        """Disable a key in memory and optionally in keystore."""
         if key_id in self._keys:
             self._keys[key_id].enabled = False
+            if persist:
+                try:
+                    ks = self._keystore
+                    if ks is None:
+                        from qz_keystore import KeyStore
+                        ks = KeyStore()
+                    for entry in ks.list_entries():
+                        if entry.env_name == key_id:
+                            ks.set_enabled(entry.provider, entry.index, False)
+                            break
+                except Exception:
+                    pass
             return True
         return False
 
@@ -153,3 +165,27 @@ class KeyRegistry:
                 seen.add(k.id)
                 combined.append(k)
         return combined
+
+    def get_key_value(self, key_id: str) -> str | None:
+        """Fetch the plaintext API key for a given key_id directly from KeyStore or environment."""
+        if not key_id:
+            return None
+        try:
+            ks = self._keystore
+            if ks is None:
+                from qz_keystore import KeyStore
+                ks = KeyStore()
+            norm = key_id.upper().replace("-", "_")
+            for entry in ks.list_entries():
+                candidates = {
+                    entry.env_name.upper(),
+                    f"{entry.provider.upper()}_KEY_{entry.index}",
+                    f"{entry.provider.upper()}_{entry.index}",
+                }
+                if norm in candidates:
+                    val = ks.get_key(entry.provider, entry.index)
+                    if val:
+                        return val
+        except Exception:
+            pass
+        return os.environ.get(key_id)

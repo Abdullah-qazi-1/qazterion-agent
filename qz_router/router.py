@@ -114,8 +114,7 @@ class SmartRouter:
 
             # 5. Reasoning support check
             if requires_reasoning and model_meta and not model_meta.supports_reasoning:
-                # If specifically requested reasoning, deprioritize or exclude non-reasoning
-                pass
+                continue
 
             # Resolve physical keys for this alias from KeyRegistry
             physical_keys = self.pool.registry.get_keys_for_alias(alias)
@@ -157,8 +156,16 @@ class SmartRouter:
         scored_candidates.sort(key=lambda item: item[2], reverse=True)
 
         if not scored_candidates:
-            # Full fallback path: all candidate keys in cooldown, disabled, or saturated
-            default_aliases = [a for a in candidate_aliases if a not in excluded] or candidate_aliases or [("groq-fast" if norm_cap == "simple" else "coder-strong")]
+            # Full fallback path: check if any eligible candidate exists
+            default_aliases = [a for a in candidate_aliases if a not in excluded]
+            if not default_aliases:
+                print(f"\033[91m[smart router] No capable route found for '{required_capability}'\033[0m")
+                _persist_event(task_id, "ROUTER_NO_ROUTE", {
+                    "reason": "no_capable_route",
+                    "required_capability": required_capability,
+                })
+                return [("NO_CAPABLE_ROUTE", "NO_CAPABLE_ROUTE", _FALLBACK_SCORE_SENTINEL)]
+
             fallback_routes = []
             for d_alias in default_aliases:
                 keys = self.pool.registry.get_keys_for_alias(d_alias)

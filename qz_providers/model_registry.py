@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Callable
 
@@ -39,6 +40,7 @@ class ModelRegistry:
         degradation_threshold: int = 3,
         unavailable_threshold: int = 5,
     ) -> None:
+        self._lock = threading.RLock()
         self._provider_registry = provider_registry
         self.degradation_threshold = degradation_threshold
         self.unavailable_threshold = unavailable_threshold
@@ -56,17 +58,51 @@ class ModelRegistry:
         return self._provider_registry or get_provider_registry()
 
     def _load_static_catalogs(self) -> None:
-        """Seed registry with static models from all registered providers."""
+        """Seed registry with static models from all registered providers and load custom aliases."""
         for prov_info in self.provider_registry.list_providers():
             adapter = self.provider_registry.get_adapter(prov_info.provider_id)
             for model in adapter.get_static_models():
                 key = (model.provider.lower(), model.model_id)
                 self._models[key] = model
+        self._load_saved_aliases()
+
+    def _get_aliases_path(self):
+        import os
+        from pathlib import Path
+        base = Path(os.environ.get("QAZTERION_DATA_DIR", Path.home() / ".qazterion"))
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            return base / "preferred_aliases.json"
+        except OSError:
+            return None
+
+    def _load_saved_aliases(self) -> None:
+        import json
+        p = self._get_aliases_path()
+        if p and p.is_file():
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    for k, v in data.items():
+                        if isinstance(v, list) and len(v) == 2:
+                            self._aliases[k.lower()] = (v[0].lower(), v[1])
+            except Exception:
+                pass
+
+    def _save_aliases(self) -> None:
+        import json
+        p = self._get_aliases_path()
+        if p:
+            try:
+                p.write_text(json.dumps(self._aliases, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
     def register_model(self, model: ModelMetadata, task_id: str | None = None) -> None:
         """Register or update model metadata."""
-        key = (model.provider.lower(), model.model_id)
-        self._models[key] = model
+        with self._lock:
+            key = (model.provider.lower(), model.model_id)
+            self._models[key] = model
         _emit_event(task_id, "MODEL_REGISTERED", {
             "provider": model.provider,
             "model_id": model.model_id,
@@ -75,28 +111,33 @@ class ModelRegistry:
         })
         self._notify(model)
 
-    def register_alias(self, alias: str, provider: str, model_id: str) -> None:
-        """Map a routing alias to a specific (provider, model_id)."""
-        self._aliases[alias.lower()] = (provider.lower(), model_id)
+    def register_alias(self, alias: str, provider: str, model_id: str, persist: bool = False) -> None:
+        """Map a routing alias to a specific (provider, model_id) and optionally persist to disk."""
+        with self._lock:
+            self._aliases[alias.lower()] = (provider.lower(), model_id)
+            if persist:
+                self._save_aliases()
 
     def get_model(self, provider: str, model_id: str) -> ModelMetadata | None:
         """Retrieve model metadata by provider and model_id, checking active and historical records."""
-        key = (provider.lower(), model_id)
-        if key in self._models:
-            return self._models[key]
-        return self._historical_models.get(key)
+        with self._lock:
+            key = (provider.lower(), model_id)
+            if key in self._models:
+                return self._models[key]
+            return self._historical_models.get(key)
 
     def get_model_by_alias(self, alias: str) -> ModelMetadata | None:
         """Retrieve model metadata given a high-level alias (e.g. 'groq-fast')."""
-        norm = alias.lower()
-        if norm in self._aliases:
-            provider, model_id = self._aliases[norm]
-            return self.get_model(provider, model_id)
-        # Try direct match where alias itself is a model_id across all models
-        for m in self._models.values():
-            if m.model_id.lower() == norm or f"{m.provider}/{m.model_id}".lower() == norm:
-                return m
-        return None
+        with self._lock:
+            norm = alias.lower()
+            if norm in self._aliases:
+                provider, model_id = self._aliases[norm]
+                return self.get_model(provider, model_id)
+            # Try direct match where alias itself is a model_id across all models
+            for m in self._models.values():
+                if m.model_id.lower() == norm or f"{m.provider}/{m.model_id}".lower() == norm:
+                    return m
+            return None
 
     def list_models(
         self,
@@ -106,22 +147,23 @@ class ModelRegistry:
         include_historical: bool = False,
     ) -> list[ModelMetadata]:
         """List models matching criteria."""
-        candidates = list(self._models.values())
-        if include_historical:
-            for hist in self._historical_models.values():
-                if (hist.provider.lower(), hist.model_id) not in self._models:
-                    candidates.append(hist)
+        with self._lock:
+            candidates = list(self._models.values())
+            if include_historical:
+                for hist in self._historical_models.values():
+                    if (hist.provider.lower(), hist.model_id) not in self._models:
+                        candidates.append(hist)
 
-        results: list[ModelMetadata] = []
-        for m in candidates:
-            if provider and m.provider.lower() != provider.lower():
-                continue
-            if state is not None and m.state != state:
-                continue
-            if capability is not None and not m.has_capability(capability):
-                continue
-            results.append(m)
-        return results
+            results: list[ModelMetadata] = []
+            for m in candidates:
+                if provider and m.provider.lower() != provider.lower():
+                    continue
+                if state is not None and m.state != state:
+                    continue
+                if capability is not None and not m.has_capability(capability):
+                    continue
+                results.append(m)
+            return results
 
     def discover_models_for_provider(
         self,
@@ -135,18 +177,16 @@ class ModelRegistry:
         try:
             discovered = adapter.discover_models(api_key=api_key)
             now = time.time()
-            discovered_keys: set[tuple[str, str]] = set()
-
-            for model in discovered:
-                model.last_discovery_time = now
-                key = (p_id, model.model_id)
-                discovered_keys.add(key)
-                if key in self._models:
-                    # Preserve existing lifecycle state and failure history
-                    prev = self._models[key]
-                    model.state = prev.state
-                    model.consecutive_failures = prev.consecutive_failures
-                self._models[key] = model
+            with self._lock:
+                for model in discovered:
+                    model.last_discovery_time = now
+                    key = (p_id, model.model_id)
+                    if key in self._models:
+                        # Preserve existing lifecycle state and failure history
+                        prev = self._models[key]
+                        model.state = prev.state
+                        model.consecutive_failures = prev.consecutive_failures
+                    self._models[key] = model
 
             _emit_event(task_id, "MODEL_DISCOVERED", {
                 "provider": p_id,
@@ -163,20 +203,20 @@ class ModelRegistry:
 
     def record_model_success(self, provider: str, model_id: str, task_id: str | None = None) -> None:
         """Record model success, recovering degraded state if needed."""
-        key = (provider.lower(), model_id)
-        model = self.get_model(provider, model_id)
-        if model:
-            model.consecutive_failures = 0
-            if model.state == ModelLifecycleState.DEGRADED:
-                model.state = ModelLifecycleState.ACTIVE
-                _emit_event(task_id, "MODEL_STATE_CHANGED", {
-                    "provider": provider,
-                    "model_id": model_id,
-                    "previous_state": "degraded",
-                    "new_state": "active",
-                    "reason": "successful_execution",
-                })
-                self._notify(model)
+        with self._lock:
+            model = self.get_model(provider, model_id)
+            if model:
+                model.consecutive_failures = 0
+                if model.state == ModelLifecycleState.DEGRADED:
+                    model.state = ModelLifecycleState.ACTIVE
+                    _emit_event(task_id, "MODEL_STATE_CHANGED", {
+                        "provider": provider,
+                        "model_id": model_id,
+                        "previous_state": "degraded",
+                        "new_state": "active",
+                        "reason": "successful_execution",
+                    })
+                    self._notify(model)
 
     def record_model_failure(
         self,
@@ -186,33 +226,34 @@ class ModelRegistry:
         task_id: str | None = None,
     ) -> None:
         """Record a failure for a model, transitioning lifecycle state if thresholds exceeded."""
-        model = self.get_model(provider, model_id)
-        if not model:
-            return
+        with self._lock:
+            model = self.get_model(provider, model_id)
+            if not model:
+                return
 
-        model.consecutive_failures += 1
-        msg = str(error) if error else ""
-        msg_lower = msg.lower()
+            model.consecutive_failures += 1
+            msg = str(error) if error else ""
+            msg_lower = msg.lower()
 
-        prev_state = model.state
-        if "not found" in msg_lower or "does not exist" in msg_lower or "unknown model" in msg_lower:
-            # Explicitly not found on upstream provider -> mark UNAVAILABLE
-            model.state = ModelLifecycleState.UNAVAILABLE
-        elif model.consecutive_failures >= self.unavailable_threshold:
-            model.state = ModelLifecycleState.UNAVAILABLE
-        elif model.consecutive_failures >= self.degradation_threshold:
-            model.state = ModelLifecycleState.DEGRADED
+            prev_state = model.state
+            if "not found" in msg_lower or "does not exist" in msg_lower or "unknown model" in msg_lower:
+                # Explicitly not found on upstream provider -> mark UNAVAILABLE
+                model.state = ModelLifecycleState.UNAVAILABLE
+            elif model.consecutive_failures >= self.unavailable_threshold:
+                model.state = ModelLifecycleState.UNAVAILABLE
+            elif model.consecutive_failures >= self.degradation_threshold:
+                model.state = ModelLifecycleState.DEGRADED
 
-        if model.state != prev_state:
-            _emit_event(task_id, "MODEL_STATE_CHANGED", {
-                "provider": provider,
-                "model_id": model_id,
-                "previous_state": prev_state.value,
-                "new_state": model.state.value,
-                "consecutive_failures": model.consecutive_failures,
-                "error": msg,
-            })
-            self._notify(model)
+            if model.state != prev_state:
+                _emit_event(task_id, "MODEL_STATE_CHANGED", {
+                    "provider": provider,
+                    "model_id": model_id,
+                    "previous_state": prev_state.value,
+                    "new_state": model.state.value,
+                    "consecutive_failures": model.consecutive_failures,
+                    "error": msg,
+                })
+                self._notify(model)
 
     def set_model_lifecycle(
         self,
