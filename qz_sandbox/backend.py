@@ -9,10 +9,12 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger("qz_sandbox")
 
@@ -344,10 +346,56 @@ def _prepare_host_command(command: str, is_windows: bool) -> list[str]:
     return ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps_script]
 
 
-class RestrictedHostBackend(ExecutionBackend):
-    """Direct host subprocess — used only when Docker is unavailable.
+def sanitize_subprocess_env(workspace: str, base_env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a sanitized environment for host execution that strips API keys and secrets."""
+    source_env = dict(base_env if base_env is not None else os.environ)
+    safe_env: dict[str, str] = {}
 
-    Results are flagged ``UNSANDBOXED`` so callers can tell isolation was skipped.
+    secret_markers = (
+        "_KEY", "_TOKEN", "_SECRET", "_AUTH", "_PASSWORD", "_PASS",
+        "_CREDENTIAL", "LITELLM_MASTER_KEY", "OPENAI_API_KEY",
+        "GROQ_KEY", "GEMINI_KEY", "MISTRAL_KEY", "OPENROUTER_KEY", "DEEPSEEK_KEY",
+    )
+
+    for k, v in source_env.items():
+        k_upper = k.upper()
+        if any(marker in k_upper for marker in secret_markers):
+            continue
+        safe_env[k] = v
+
+    current_pp = safe_env.get("PYTHONPATH", "")
+    safe_env["PYTHONPATH"] = f"{workspace}{os.pathsep}{current_pp}" if current_pp else str(workspace)
+    return safe_env
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Terminate the process and all its descendants."""
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+    else:
+        import signal
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+
+class UnsandboxedHostBackend(ExecutionBackend):
+    """Direct host subprocess — used when Docker is unavailable or command is not translatable.
+
+    Results are flagged ``UNSANDBOXED`` and include process tree termination on timeout.
     """
 
     def run(
@@ -361,46 +409,62 @@ class RestrictedHostBackend(ExecutionBackend):
     ) -> ExecutionResult:
         del allow_network  # Host fallback cannot isolate the network.
         is_windows = os.name == "nt"
+        workspace_path = Path(workspace).resolve()
+        if not workspace_path.is_dir():
+            return ExecutionResult(
+                stdout="",
+                stderr="",
+                exit_code=-1,
+                timed_out=False,
+                error=f"Workspace is not a directory: {workspace_path}",
+                isolation="UNSANDBOXED",
+                fallback_reason=unsandboxed_reason,
+            )
         shell_args = _prepare_host_command(command, is_windows=is_windows)
         logger.warning(
             "sandbox backend=UNSANDBOXED workspace=%s timeout=%s (%s)",
-            workspace,
+            workspace_path,
             timeout,
-            unsandboxed_reason or "Docker unavailable; command runs on the host",
+            unsandboxed_reason or "explicit unsandboxed host execution",
         )
-        env = dict(os.environ)
-        current_pp = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = f"{workspace}{os.pathsep}{current_pp}" if current_pp else str(workspace)
+        env = sanitize_subprocess_env(str(workspace_path))
+
+        popen_kwargs: dict[str, Any] = {
+            "cwd": str(workspace_path),
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "errors": "replace",
+            "env": env,
+        }
+        if not is_windows:
+            popen_kwargs["preexec_fn"] = os.setsid
 
         try:
-            completed = subprocess.run(
-                shell_args,
-                cwd=workspace,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=timeout,
-                env=env,
-            )
-            return ExecutionResult(
-                stdout=completed.stdout or "",
-                stderr=completed.stderr or "",
-                exit_code=completed.returncode,
-                timed_out=False,
-                error=None,
-                isolation="UNSANDBOXED",
-                fallback_reason=unsandboxed_reason,
-            )
-        except subprocess.TimeoutExpired as exc:
-            return ExecutionResult(
-                stdout=_decode_captured(exc.stdout),
-                stderr=_decode_captured(exc.stderr),
-                exit_code=-1,
-                timed_out=True,
-                error="timeout",
-                isolation="UNSANDBOXED",
-                fallback_reason=unsandboxed_reason,
-            )
+            proc = subprocess.Popen(shell_args, **popen_kwargs)
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+                return ExecutionResult(
+                    stdout=stdout or "",
+                    stderr=stderr or "",
+                    exit_code=proc.returncode,
+                    timed_out=False,
+                    error=None,
+                    isolation="UNSANDBOXED",
+                    fallback_reason=unsandboxed_reason,
+                )
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(proc.pid)
+                stdout, stderr = proc.communicate()
+                return ExecutionResult(
+                    stdout=_decode_captured(stdout),
+                    stderr=_decode_captured(stderr),
+                    exit_code=-1,
+                    timed_out=True,
+                    error="timeout",
+                    isolation="UNSANDBOXED",
+                    fallback_reason=unsandboxed_reason,
+                )
         except OSError as exc:
             return ExecutionResult(
                 stdout="",
@@ -411,3 +475,7 @@ class RestrictedHostBackend(ExecutionBackend):
                 isolation="UNSANDBOXED",
                 fallback_reason=unsandboxed_reason,
             )
+
+
+# Backwards compatibility alias
+RestrictedHostBackend = UnsandboxedHostBackend

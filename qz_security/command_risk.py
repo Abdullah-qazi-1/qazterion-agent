@@ -44,9 +44,16 @@ _HIGH: tuple[tuple[str, str], ...] = (
     (r"\b(cmdkey|whoami\s+/priv|procdump)\b", "credential/privilege probe"),
     (r"\b(icacls|takeown)\b", "acl takeover"),
     (r"start-process[^\n]*-verb\s+runas", "elevation"),
-    (r"\bgit\s+reset\s+--hard\b|\bgit\s+clean\s+-", "destructive git"),
     (r"\bnetsh\b", "network stack change"),
     (r"\b(rundll32|regsvr32|mshta|wscript|cscript)\b", "script host"),
+    (r"\b(python\d*|py|pythonw)(?:\.exe)?\s+([^\n]*\s)?(-c|--command|-m\s+(?!pytest\b|unittest\b|pip\b|venv\b))\b", "inline python execution"),
+    (r"\b(node|nodejs|deno|bun)(?:\.exe)?\s+([^\n]*\s)?(-e|--eval|-p|--print)\b", "inline js/ts execution"),
+    (r"\b(perl|ruby|php|lua|tclsh|osascript|groovy|scala|julia|erl|elixir)\b", "unrestricted interpreter execution"),
+    (r"\b(bash|sh|zsh|ksh|csh|dash)(?:\.exe)?\s+([^\n]*\s)?(-c)\b", "inline shell execution"),
+    (r"\b(powershell|pwsh|cmd)(?:\.exe)?\s+([^\n]*\s)?(-c|-command|/c|/k)\b", "nested shell invocation"),
+    (r"\b(urllib|requests|socket|http\.client|aiohttp|httpx)\b", "network socket/http access"),
+    (r"\bshutil\.(rmtree|move|copy)\b|\bos\.(remove|unlink|rmdir|system|popen)\b", "interpreter filesystem/process mutation"),
+    (r"\b(eval|exec)\s*\(|\b__import__\b|\bsubprocess\.(Popen|run|call|check_call|check_output)\b", "dynamic code execution"),
 )
 
 _MEDIUM: tuple[tuple[str, str], ...] = (
@@ -64,6 +71,17 @@ _COMPILED = [
 ]
 
 
+_INTERPRETER_REASON_MARKERS = (
+    "inline python",
+    "inline js/ts",
+    "unrestricted interpreter",
+    "inline shell",
+    "nested shell",
+    "dynamic code",
+    "script host",
+)
+
+
 def classify_command(command: str) -> tuple[RiskLevel, list[str]]:
     """Return the highest matching risk level and human-readable reasons."""
     text = command or ""
@@ -76,3 +94,10 @@ def classify_command(command: str) -> tuple[RiskLevel, list[str]]:
             reasons = matched
             break
     return level, reasons
+
+
+def invokes_unrestricted_interpreter(command: str) -> bool:
+    """True when the command can run attacker-controlled code in an interpreter."""
+    _level, reasons = classify_command(command)
+    lowered = [r.lower() for r in reasons]
+    return any(any(marker in reason for marker in _INTERPRETER_REASON_MARKERS) for reason in lowered)

@@ -112,11 +112,10 @@ class GatewayBlockingTests(unittest.TestCase):
         from qz_sandbox.manager import SandboxManager
 
         with patch("qz_tools.get_manager", return_value=SandboxManager(docker_available=False)):
-            with patch("qz_sandbox.backend.subprocess.run") as run:
-                run.return_value.returncode = 0
-                run.return_value.stdout = "ok"
-                run.return_value.stderr = ""
+            with patch("qz_sandbox.backend.subprocess.Popen") as popen_mock:
+                popen_mock.return_value.communicate.return_value = ("ok", "")
+                popen_mock.return_value.returncode = 0
                 result = qz_tools.run_command("pip install pytest")
         self.assertIn("exit_code=0", result)
         self.assertNotIn("Denied by security policy", result)
-        run.assert_called()
+        popen_mock.assert_called()

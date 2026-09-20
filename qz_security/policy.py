@@ -29,7 +29,7 @@ def decide(tool_name: str, args: dict, risk: RiskLevel, *, path_ok: bool = True)
     if not path_ok:
         return Decision.DENY
     if tool_name == "run_command":
-        if risk is RiskLevel.FORBIDDEN or risk is RiskLevel.HIGH:
+        if risk in (RiskLevel.FORBIDDEN, RiskLevel.HIGH):
             return Decision.DENY
         if risk is RiskLevel.MEDIUM:
             return Decision.ASK

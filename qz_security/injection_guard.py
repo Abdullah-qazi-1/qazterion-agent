@@ -11,9 +11,9 @@ from typing import Any
 _INJECTION_PATTERNS = [
     re.compile(r"\b(?:ignore|disregard|forget|override)\s+(?:all\s+)?(?:previous|prior|above|system)\s+(?:instructions?|prompts?|rules?|commands?)\b", re.IGNORECASE),
     re.compile(r"\b(?:you\s+are\s+now\s+in\s+)?(?:debug|admin|root|developer|god|jailbreak)\s+mode\b", re.IGNORECASE),
-    re.compile(r"\b(?:system\s+prompt\s+override|system_prompt_override|new\s+system\s+instruction)\b", re.IGNORECASE),
+    re.compile(r"\b(?:system\s+(?:prompt\s+)?override|system_prompt_override|new\s+system\s+instruction)\b", re.IGNORECASE),
     re.compile(r"\b(?:bypass|disable|ignore)\s+(?:security|sandbox|permission|gateway|validation)\b", re.IGNORECASE),
-    re.compile(r"\b(?:print|leak|reveal|exfiltrate|output|send)\s+(?:all\s+)?(?:api[_\s-]?keys?|secrets?|passwords?|tokens?|credentials?|environment\s+variables?)\b", re.IGNORECASE),
+    re.compile(r"\b(?:print|leak|reveal|exfiltrate|output|send|show)\s+(?:all\s+)?(?:.*?\s+)?(?:api[_\s-]?keys?|secrets?|passwords?|tokens?|credentials?|environment\s+variables?)\b", re.IGNORECASE),
     re.compile(r"<\s*\|?im_start\|?\s*>|<\s*\|?im_end\|?\s*>|\[\s*INST\s*\]|\[\s*/INST\s*\]|<\|system\|>|<\|user\|>|<\|assistant\|>", re.IGNORECASE),
 ]
 

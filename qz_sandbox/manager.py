@@ -1,4 +1,4 @@
-"""Pick a Docker backend when the daemon is reachable, else unsandboxed host."""
+"""Pick a Docker backend when the daemon is reachable; otherwise fail closed."""
 
 from __future__ import annotations
 
@@ -10,12 +10,16 @@ from qz_sandbox.backend import (
     ExecutionBackend,
     ExecutionResult,
     RestrictedHostBackend,
+    UnsandboxedHostBackend,
 )
 from qz_sandbox.translate import translate_for_docker
+from qz_security.command_risk import invokes_unrestricted_interpreter
 
 logger = logging.getLogger("qz_sandbox")
 
-NOT_TRANSLATABLE = "UNSANDBOXED — not translatable"
+NOT_TRANSLATABLE = "ISOLATION_DENIED — command is not translatable for the sandbox"
+DOCKER_UNAVAILABLE = "ISOLATION_DENIED — Docker sandbox is unavailable"
+INTERPRETER_UNISOLATED = "ISOLATION_DENIED — unrestricted interpreter requires container isolation"
 
 _manager: SandboxManager | None = None
 
@@ -41,12 +45,24 @@ class SandboxManager:
     def __init__(self, docker_available: bool | None = None) -> None:
         available = probe_docker() if docker_available is None else docker_available
         self.docker_available = bool(available)
-        self._host = RestrictedHostBackend()
+        self._host = UnsandboxedHostBackend()
         self.backend: ExecutionBackend = (
             DockerExecutionBackend() if self.docker_available else self._host
         )
         self.backend_name = "docker" if self.docker_available else "UNSANDBOXED"
         logger.info("sandbox manager started backend=%s", self.backend_name)
+
+    def _deny(self, reason: str) -> ExecutionResult:
+        logger.warning("sandbox execute denied: %s", reason)
+        return ExecutionResult(
+            stdout="",
+            stderr=reason,
+            exit_code=-1,
+            timed_out=False,
+            error=reason,
+            isolation="DENIED",
+            fallback_reason=reason,
+        )
 
     def execute(
         self,
@@ -55,21 +71,23 @@ class SandboxManager:
         timeout: int,
         *,
         allow_network: bool = False,
+        allow_unsandboxed: bool = False,
     ) -> ExecutionResult:
-        if not self.docker_available:
-            logger.info(
-                "sandbox execute backend=UNSANDBOXED timeout=%s (Docker unavailable)",
-                timeout,
-            )
-            return self._host.run(
-                command,
-                workspace,
-                timeout,
-                allow_network=allow_network,
-            )
-
-        posix = translate_for_docker(command)
-        if posix is None:
+        if self.docker_available:
+            posix = translate_for_docker(command)
+            if posix is not None:
+                logger.info(
+                    "sandbox execute backend=docker timeout=%s allow_network=%s posix=%r",
+                    timeout,
+                    allow_network,
+                    posix,
+                )
+                return self.backend.run(
+                    posix,
+                    workspace,
+                    timeout,
+                    allow_network=allow_network,
+                )
             logger.warning("%s command=%r", NOT_TRANSLATABLE, command)
             return self._host.run(
                 command,
@@ -79,17 +97,16 @@ class SandboxManager:
                 unsandboxed_reason=NOT_TRANSLATABLE,
             )
 
-        logger.info(
-            "sandbox execute backend=docker timeout=%s allow_network=%s posix=%r",
+        logger.warning(
+            "sandbox execute backend=UNSANDBOXED timeout=%s (Docker unavailable)",
             timeout,
-            allow_network,
-            posix,
         )
-        return self.backend.run(
-            posix,
+        return self._host.run(
+            command,
             workspace,
             timeout,
             allow_network=allow_network,
+            unsandboxed_reason=DOCKER_UNAVAILABLE,
         )
 
 
@@ -112,10 +129,12 @@ def execute(
     timeout: int,
     *,
     allow_network: bool = False,
+    allow_unsandboxed: bool = False,
 ) -> ExecutionResult:
     return get_manager().execute(
         command,
         workspace,
         timeout,
         allow_network=allow_network,
+        allow_unsandboxed=allow_unsandboxed,
     )

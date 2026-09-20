@@ -49,18 +49,19 @@ class SandboxManagerTests(unittest.TestCase):
 
     def test_non_translatable_command_falls_back_with_auditable_reason(self):
         manager = SandboxManager(docker_available=True)
-        host_result = SimpleNamespace(returncode=0, stdout="hello\n", stderr="")
         with tempfile.TemporaryDirectory() as workspace:
-            with patch("qz_sandbox.backend.subprocess.run", return_value=host_result) as run:
+            with patch("qz_sandbox.backend.subprocess.Popen") as popen_mock, patch("qz_sandbox.backend.subprocess.run") as run_mock:
+                popen_mock.return_value.communicate.return_value = ("hello\n", "")
+                popen_mock.return_value.returncode = 0
                 with self.assertLogs("qz_sandbox", level="WARNING") as logged:
                     result = manager.execute("Write-Output hello", workspace, timeout=10)
         self.assertEqual(result.isolation, "UNSANDBOXED")
         self.assertEqual(result.fallback_reason, NOT_TRANSLATABLE)
         self.assertTrue(any(NOT_TRANSLATABLE in message for message in logged.output))
-        self.assertEqual(run.call_args.args[0][0], "powershell.exe" if os.name == "nt" else "/bin/sh")
+        self.assertEqual(popen_mock.call_args.args[0][0], "powershell.exe" if os.name == "nt" else "/bin/sh")
         docker_invoked = any(
             call.args and call.args[0] and call.args[0][0] == "docker"
-            for call in run.call_args_list
+            for call in run_mock.call_args_list
         )
         self.assertFalse(docker_invoked)
 
