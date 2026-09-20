@@ -98,6 +98,9 @@ class BudgetExceededError(RuntimeError):
     """Raised when a task exceeds its configured token or cost budget limit."""
 
 
+import threading
+
+
 class UsageTracker:
     def __init__(
         self,
@@ -106,8 +109,10 @@ class UsageTracker:
         cooldown_seconds: float = _DEFAULT_COOLDOWN_SECONDS,
         quota_cooldown_seconds: float = _DEFAULT_QUOTA_COOLDOWN_SECONDS,
     ) -> None:
+        self._lock = threading.RLock()
         self.log_path = Path(log_path) if log_path else None
         self._events: deque[dict] = deque(maxlen=max_events)
+        self._task_totals: dict[str, dict[str, Any]] = {}
         self._flags: dict[str, _Flag] = {}
         self._budgets: dict[str, TaskBudget] = {}
         self._cooldown = cooldown_seconds
@@ -128,6 +133,13 @@ class UsageTracker:
             lines = self.log_path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict):
+                self._accumulate_task_total(event)
         for line in lines[-self._events.maxlen:]:
             try:
                 event = json.loads(line)
@@ -135,6 +147,55 @@ class UsageTracker:
                 continue
             if isinstance(event, dict):
                 self._events.append(event)
+
+    def _accumulate_task_total(self, event: dict[str, Any]) -> None:
+        t_id = event.get("task_id")
+        if not t_id:
+            return
+        if t_id not in self._task_totals:
+            self._task_totals[t_id] = {
+                "task_id": t_id,
+                "request_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost": 0.0,
+                "total_duration": 0.0,
+                "success_count": 0,
+                "error_count": 0,
+                "fallback_count": 0,
+                "models_used": set(),
+                "providers_used": set(),
+            }
+        t = self._task_totals[t_id]
+        t["request_count"] += 1
+        t["input_tokens"] += int(event.get("input_tokens") or 0)
+        t["output_tokens"] += int(event.get("output_tokens") or 0)
+        t["total_tokens"] += int(event.get("total_tokens") or 0)
+        t["estimated_cost"] = round(t["estimated_cost"] + float(event.get("estimated_cost") or 0.0), 6)
+        t["total_duration"] = round(t["total_duration"] + float(event.get("duration") or 0.0), 3)
+        if event.get("success"):
+            t["success_count"] += 1
+        else:
+            t["error_count"] += 1
+        if event.get("fallback_from"):
+            t["fallback_count"] += 1
+        if event.get("model"):
+            t["models_used"].add(event["model"])
+        if event.get("provider"):
+            t["providers_used"].add(event["provider"])
+
+    def _rotate_log_if_needed(self) -> None:
+        if not self.log_path or not self.log_path.is_file():
+            return
+        try:
+            if self.log_path.stat().st_size > 10 * 1024 * 1024:  # 10MB
+                backup_path = self.log_path.with_suffix(".jsonl.1")
+                if backup_path.exists():
+                    backup_path.unlink()
+                self.log_path.rename(backup_path)
+        except OSError:
+            pass
 
     # ---- budget management --------------------------------------------------
 
@@ -145,69 +206,104 @@ class UsageTracker:
         max_cost: float | None = None,
         warning_threshold: float = 0.80,
     ) -> None:
-        self._budgets[task_id] = TaskBudget(
-            max_tokens=max_tokens,
-            max_cost=max_cost,
-            warning_threshold=warning_threshold,
-        )
+        with self._lock:
+            self._budgets[task_id] = TaskBudget(
+                max_tokens=max_tokens,
+                max_cost=max_cost,
+                warning_threshold=warning_threshold,
+            )
 
     def check_task_budget(self, task_id: str | None) -> tuple[bool, str | None, bool]:
         """Check if task is within budget. Returns (is_ok, message, is_warning_only)."""
-        if not task_id or task_id not in self._budgets:
+        with self._lock:
+            if not task_id or task_id not in self._budgets:
+                return True, None, False
+
+            budget = self._budgets[task_id]
+            usage = self.get_task_usage(task_id)
+
+            # 1. Check token limits
+            if budget.max_tokens is not None and budget.max_tokens > 0:
+                if usage["total_tokens"] >= budget.max_tokens:
+                    msg = f"Task {task_id} exceeded token limit ({usage['total_tokens']:,}/{budget.max_tokens:,})"
+                    return False, msg, False
+                if usage["total_tokens"] >= int(budget.max_tokens * budget.warning_threshold):
+                    msg = f"Task {task_id} approaching token limit ({usage['total_tokens']:,}/{budget.max_tokens:,})"
+                    return True, msg, True
+
+            # 2. Check cost limits
+            if budget.max_cost is not None and budget.max_cost > 0:
+                if usage["estimated_cost"] >= budget.max_cost:
+                    msg = f"Task {task_id} exceeded cost limit (${usage['estimated_cost']:.4f}/${budget.max_cost:.4f})"
+                    return False, msg, False
+                if usage["estimated_cost"] >= (budget.max_cost * budget.warning_threshold):
+                    msg = f"Task {task_id} approaching cost limit (${usage['estimated_cost']:.4f}/${budget.max_cost:.4f})"
+                    return True, msg, True
+
             return True, None, False
 
-        budget = self._budgets[task_id]
-        usage = self.get_task_usage(task_id)
-
-        # 1. Check token limits
-        if budget.max_tokens is not None and budget.max_tokens > 0:
-            if usage["total_tokens"] >= budget.max_tokens:
-                msg = f"Task {task_id} exceeded token limit ({usage['total_tokens']:,}/{budget.max_tokens:,})"
-                return False, msg, False
-            if usage["total_tokens"] >= int(budget.max_tokens * budget.warning_threshold):
-                msg = f"Task {task_id} approaching token limit ({usage['total_tokens']:,}/{budget.max_tokens:,})"
-                return True, msg, True
-
-        # 2. Check cost limits
-        if budget.max_cost is not None and budget.max_cost > 0:
-            if usage["estimated_cost"] >= budget.max_cost:
-                msg = f"Task {task_id} exceeded cost limit (${usage['estimated_cost']:.4f}/${budget.max_cost:.4f})"
-                return False, msg, False
-            if usage["estimated_cost"] >= (budget.max_cost * budget.warning_threshold):
-                msg = f"Task {task_id} approaching cost limit (${usage['estimated_cost']:.4f}/${budget.max_cost:.4f})"
-                return True, msg, True
-
-        return True, None, False
+    def admit_request(self, task_id: str | None, estimated_in_tokens: int = 0) -> tuple[bool, str | None]:
+        """Pre-request hard budget check. Returns (is_allowed, reason)."""
+        with self._lock:
+            if not task_id or task_id not in self._budgets:
+                return True, None
+            budget = self._budgets[task_id]
+            usage = self.get_task_usage(task_id)
+            if budget.max_tokens is not None and budget.max_tokens > 0:
+                if usage["total_tokens"] + estimated_in_tokens > budget.max_tokens:
+                    return False, f"Task {task_id} exceeds hard token limit ({usage['total_tokens'] + estimated_in_tokens:,}/{budget.max_tokens:,})"
+            if budget.max_cost is not None and budget.max_cost > 0:
+                if usage["estimated_cost"] >= budget.max_cost:
+                    return False, f"Task {task_id} reached hard cost limit (${usage['estimated_cost']:.4f}/${budget.max_cost:.4f})"
+            return True, None
 
     def get_task_usage(self, task_id: str) -> dict[str, Any]:
         """Aggregate usage metrics for a specific task."""
-        task_events = [e for e in self._events if e.get("task_id") == task_id]
-        total_in = sum(int(e.get("input_tokens") or 0) for e in task_events)
-        total_out = sum(int(e.get("output_tokens") or 0) for e in task_events)
-        total_tokens = sum(int(e.get("total_tokens") or 0) for e in task_events)
-        total_cost = sum(float(e.get("estimated_cost") or 0.0) for e in task_events)
-        total_duration = sum(float(e.get("duration") or 0.0) for e in task_events)
-        success_count = sum(1 for e in task_events if e.get("success"))
-        error_count = sum(1 for e in task_events if not e.get("success"))
-        fallback_count = sum(1 for e in task_events if e.get("fallback_from"))
+        with self._lock:
+            if task_id in self._task_totals:
+                t = self._task_totals[task_id]
+                return {
+                    "task_id": task_id,
+                    "request_count": t["request_count"],
+                    "input_tokens": t["input_tokens"],
+                    "output_tokens": t["output_tokens"],
+                    "total_tokens": t["total_tokens"],
+                    "estimated_cost": t["estimated_cost"],
+                    "total_duration": t["total_duration"],
+                    "success_count": t["success_count"],
+                    "error_count": t["error_count"],
+                    "fallback_count": t["fallback_count"],
+                    "models_used": sorted(t["models_used"]),
+                    "providers_used": sorted(t["providers_used"]),
+                }
 
-        models_used = sorted(set(e.get("model") for e in task_events if e.get("model")))
-        providers_used = sorted(set(e.get("provider") for e in task_events if e.get("provider")))
+            task_events = [e for e in self._events if e.get("task_id") == task_id]
+            total_in = sum(int(e.get("input_tokens") or 0) for e in task_events)
+            total_out = sum(int(e.get("output_tokens") or 0) for e in task_events)
+            total_tokens = sum(int(e.get("total_tokens") or 0) for e in task_events)
+            total_cost = sum(float(e.get("estimated_cost") or 0.0) for e in task_events)
+            total_duration = sum(float(e.get("duration") or 0.0) for e in task_events)
+            success_count = sum(1 for e in task_events if e.get("success"))
+            error_count = sum(1 for e in task_events if not e.get("success"))
+            fallback_count = sum(1 for e in task_events if e.get("fallback_from"))
 
-        return {
-            "task_id": task_id,
-            "request_count": len(task_events),
-            "input_tokens": total_in,
-            "output_tokens": total_out,
-            "total_tokens": total_tokens,
-            "estimated_cost": round(total_cost, 6),
-            "total_duration": round(total_duration, 3),
-            "success_count": success_count,
-            "error_count": error_count,
-            "fallback_count": fallback_count,
-            "models_used": models_used,
-            "providers_used": providers_used,
-        }
+            models_used = sorted(set(e.get("model") for e in task_events if e.get("model")))
+            providers_used = sorted(set(e.get("provider") for e in task_events if e.get("provider")))
+
+            return {
+                "task_id": task_id,
+                "request_count": len(task_events),
+                "input_tokens": total_in,
+                "output_tokens": total_out,
+                "total_tokens": total_tokens,
+                "estimated_cost": round(total_cost, 6),
+                "total_duration": round(total_duration, 3),
+                "success_count": success_count,
+                "error_count": error_count,
+                "fallback_count": fallback_count,
+                "models_used": models_used,
+                "providers_used": providers_used,
+            }
 
     # ---- recording ----------------------------------------------------------
 
@@ -235,123 +331,131 @@ class UsageTracker:
         retry_count: int = 0,
         rate_limit: dict[str, Any] | None = None,
     ) -> None:
-        if not total_tokens:
-            total_tokens = input_tokens + output_tokens
+        with self._lock:
+            if not total_tokens:
+                total_tokens = input_tokens + output_tokens
 
-        if estimated_cost is None and total_tokens > 0:
-            estimated_cost = calculate_estimated_cost(
-                model=model,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                provider=provider,
-            )
-        elif estimated_cost is None:
-            estimated_cost = 0.0
+            if estimated_cost is None and total_tokens > 0:
+                estimated_cost = calculate_estimated_cost(
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    provider=provider,
+                )
+            elif estimated_cost is None:
+                estimated_cost = 0.0
 
-        event = {
-            "request_id": request_id or str(uuid.uuid4()),
-            "ts": time.time(),
-            "model": model,
-            "provider": provider,
-            "key_id": key_id,
-            "task_id": task_id,
-            "subtask_id": subtask_id,
-            "attempt": attempt,
-            "duration": duration,
-            "success": bool(success),
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-            "is_estimated": is_estimated,
-            "estimated_cost": estimated_cost,
-            "error": error,
-            "fallback_from": fallback_from,
-            "task_type": task_type,
-            "http_status": http_status,
-            "retry_count": retry_count,
-            # Provider values are confirmed only when supplied by a response;
-            # observed flags are intentionally labelled rather than guessed.
-            "rate_limit": rate_limit or {"status": "unknown"},
-        }
-        self._events.append(event)
-        if self.log_path:
-            with self.log_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(event) + "\n")
-        if success and key_id:
-            self._flags.pop(key_id, None)
+            event = {
+                "request_id": request_id or str(uuid.uuid4()),
+                "ts": time.time(),
+                "model": model,
+                "provider": provider,
+                "key_id": key_id,
+                "task_id": task_id,
+                "subtask_id": subtask_id,
+                "attempt": attempt,
+                "duration": duration,
+                "success": bool(success),
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "is_estimated": is_estimated,
+                "estimated_cost": estimated_cost,
+                "error": error,
+                "fallback_from": fallback_from,
+                "task_type": task_type,
+                "http_status": http_status,
+                "retry_count": retry_count,
+                # Provider values are confirmed only when supplied by a response;
+                # observed flags are intentionally labelled rather than guessed.
+                "rate_limit": rate_limit or {"status": "unknown"},
+            }
+            self._events.append(event)
+            self._accumulate_task_total(event)
+            if self.log_path:
+                self._rotate_log_if_needed()
+                with self.log_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(event) + "\n")
+            if success and key_id:
+                self._flags.pop(key_id, None)
 
     def mark_rate_limited(self, key_id: str) -> None:
-        self._flags[key_id] = _Flag(reason="rate_limited", since=time.time())
+        with self._lock:
+            self._flags[key_id] = _Flag(reason="rate_limited", since=time.time())
 
     def mark_quota_exhausted(self, key_id: str) -> None:
-        self._flags[key_id] = _Flag(reason="quota_exhausted", since=time.time())
+        with self._lock:
+            self._flags[key_id] = _Flag(reason="quota_exhausted", since=time.time())
 
     def clear_flag(self, key_id: str) -> None:
-        self._flags.pop(key_id, None)
+        with self._lock:
+            self._flags.pop(key_id, None)
 
     def is_key_eligible(self, key_id: str) -> bool:
         """False while a key is inside its post-failure cooldown window."""
-        flag = self._flags.get(key_id)
-        if flag is None:
-            return True
-        cooldown = self._quota_cooldown if flag.reason == "quota_exhausted" else self._cooldown
-        return (time.time() - flag.since) >= cooldown
+        with self._lock:
+            flag = self._flags.get(key_id)
+            if flag is None:
+                return True
+            cooldown = self._quota_cooldown if flag.reason == "quota_exhausted" else self._cooldown
+            return (time.time() - flag.since) >= cooldown
 
     # ---- reporting ------------------------------------------------------
 
     def summary(self) -> dict[str, Any]:
-        events = list(self._events)
-        successes = [event for event in events if event["success"]]
-        errors = [event for event in events if not event["success"]]
-        fallbacks = [event for event in events if event.get("fallback_from")]
-        last = events[-1] if events else None
-        last_success = successes[-1] if successes else None
+        with self._lock:
+            events = list(self._events)
+            successes = [event for event in events if event["success"]]
+            errors = [event for event in events if not event["success"]]
+            fallbacks = [event for event in events if event.get("fallback_from")]
+            last = events[-1] if events else None
+            last_success = successes[-1] if successes else None
 
-        total_input_tokens = sum(int(e.get("input_tokens") or 0) for e in events)
-        total_output_tokens = sum(int(e.get("output_tokens") or 0) for e in events)
-        total_tokens = sum(int(e.get("total_tokens") or 0) for e in events)
-        total_cost = sum(float(e.get("estimated_cost") or 0.0) for e in events)
+            total_input_tokens = sum(int(e.get("input_tokens") or 0) for e in events)
+            total_output_tokens = sum(int(e.get("output_tokens") or 0) for e in events)
+            total_tokens = sum(int(e.get("total_tokens") or 0) for e in events)
+            total_cost = sum(float(e.get("estimated_cost") or 0.0) for e in events)
 
-        def aggregate(items: list[dict]) -> dict[str, Any]:
-            total = len(items)
-            ok = sum(1 for item in items if item.get("success"))
-            return {"requests": total, "tokens": sum(int(item.get("total_tokens") or 0) for item in items),
-                    "cost": round(sum(float(item.get("estimated_cost") or 0) for item in items), 6),
-                    "success_rate": round((ok / total) * 100, 1) if total else 0.0,
-                    "latency_ms": round((sum(float(item.get("duration") or 0) for item in items) / total) * 1000, 1) if total else 0.0,
-                    "evidence": "observed"}
+            def aggregate(items: list[dict]) -> dict[str, Any]:
+                total = len(items)
+                ok = sum(1 for item in items if item.get("success"))
+                return {"requests": total, "tokens": sum(int(item.get("total_tokens") or 0) for item in items),
+                        "cost": round(sum(float(item.get("estimated_cost") or 0) for item in items), 6),
+                        "success_rate": round((ok / total) * 100, 1) if total else 0.0,
+                        "latency_ms": round((sum(float(item.get("duration") or 0) for item in items) / total) * 1000, 1) if total else 0.0,
+                        "evidence": "observed"}
 
-        # Group by model/provider/API key. Key IDs are never returned here;
-        # the UI receives their masked form only.
-        by_model: dict[str, dict[str, Any]] = {}
-        by_provider: dict[str, list[dict]] = {}
-        by_key: dict[str, list[dict]] = {}
-        for e in events:
-            m = e.get("model", "unknown")
-            by_model.setdefault(m, []).append(e)
-            by_provider.setdefault(str(e.get("provider") or "unknown"), []).append(e)
-            if e.get("key_id"):
-                by_key.setdefault(mask_key(str(e["key_id"])), []).append(e)
+            # Group by model/provider/API key. Key IDs are never returned here;
+            # the UI receives their masked form only.
+            by_model: dict[str, dict[str, Any]] = {}
+            by_provider: dict[str, list[dict]] = {}
+            by_key: dict[str, list[dict]] = {}
+            for e in events:
+                m = e.get("model", "unknown")
+                by_model.setdefault(m, []).append(e)
+                by_provider.setdefault(str(e.get("provider") or "unknown"), []).append(e)
+                if e.get("key_id"):
+                    by_key.setdefault(mask_key(str(e["key_id"])), []).append(e)
 
-        return {
-            "request_count": len(events),
-            "error_count": len(errors),
-            "fallback_count": len(fallbacks),
-            "total_input_tokens": total_input_tokens,
-            "total_output_tokens": total_output_tokens,
-            "total_tokens": total_tokens,
-            "estimated_cost": round(total_cost, 6),
-            "by_model": {name: aggregate(items) for name, items in by_model.items()},
-            "by_provider": {name: aggregate(items) for name, items in by_provider.items()},
-            "by_key": {name: aggregate(items) for name, items in by_key.items()},
-            "global_pool": aggregate(events),
-            "last_model": last["model"] if last else None,
-            "last_key_id": mask_key(last["key_id"]) if last and last.get("key_id") else None,
-            "last_duration": last["duration"] if last else None,
-            "last_success_at": last_success["ts"] if last_success else None,
-            "last_error": errors[-1]["error"] if errors else None,
-            "flagged_keys": {
-                key_id: {"reason": flag.reason, "since": flag.since, "eligible_again": self.is_key_eligible(key_id)}
-                for key_id, flag in self._flags.items()
-            },
-        }
+            return {
+                "request_count": len(events),
+                "error_count": len(errors),
+                "fallback_count": len(fallbacks),
+                "total_input_tokens": total_input_tokens,
+                "total_output_tokens": total_output_tokens,
+                "total_tokens": total_tokens,
+                "estimated_cost": round(total_cost, 6),
+                "by_model": {name: aggregate(items) for name, items in by_model.items()},
+                "by_provider": {name: aggregate(items) for name, items in by_provider.items()},
+                "by_key": {name: aggregate(items) for name, items in by_key.items()},
+                "global_pool": aggregate(events),
+                "last_model": last["model"] if last else None,
+                "last_key_id": mask_key(last["key_id"]) if last and last.get("key_id") else None,
+                "last_duration": last["duration"] if last else None,
+                "last_success_at": last_success["ts"] if last_success else None,
+                "last_error": errors[-1]["error"] if errors else None,
+                "flagged_keys": {
+                    key_id: {"reason": flag.reason, "since": flag.since, "eligible_again": self.is_key_eligible(key_id)}
+                    for key_id, flag in self._flags.items()
+                },
+            }

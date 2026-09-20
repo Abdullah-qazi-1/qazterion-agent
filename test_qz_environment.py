@@ -34,13 +34,14 @@ class ProjectEnvironmentTests(unittest.TestCase):
             from qz_sandbox.manager import SandboxManager
 
             with patch("qz_tools.get_manager", return_value=SandboxManager(docker_available=False)):
-                with patch("qz_sandbox.backend.subprocess.run") as run:
-                    run.return_value = SimpleNamespace(returncode=0, stdout="ok", stderr="")
+                with patch("qz_sandbox.backend.subprocess.Popen") as popen_mock:
+                    popen_mock.return_value.communicate.return_value = ("ok", "")
+                    popen_mock.return_value.returncode = 0
                     old = qz_tools._PROJECT_PYTHON
                     try:
                         qz_tools.configure_project_environment(root)
                         qz_tools.run_command("python -m pytest")
-                        self.assertIn(str(interpreter.resolve()), run.call_args.args[0][-1])
+                        self.assertIn(str(interpreter.resolve()), popen_mock.call_args.args[0][-1])
                     finally:
                         qz_tools._PROJECT_PYTHON = old
 

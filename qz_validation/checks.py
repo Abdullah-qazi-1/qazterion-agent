@@ -25,6 +25,8 @@ class CheckStatus(str, Enum):
     FAIL = "FAIL"
     SKIPPED = "SKIPPED"
     ERROR = "ERROR"
+    NOT_RUN = "NOT_RUN"
+    UNVERIFIED = "UNVERIFIED"
 
 
 @dataclass(frozen=True)
@@ -89,7 +91,7 @@ def run_tests(
             name="tests",
             status=CheckStatus.SKIPPED,
             summary="No test runner or test command detected for workspace.",
-            is_required=is_required,
+            is_required=False,
             duration_seconds=time.monotonic() - start_time,
         )
 
@@ -403,9 +405,6 @@ def run_security_scan(
                 if ext in _EXCLUDED_SCAN_EXTENSIONS:
                     continue
                 file_path = Path(root) / file
-                # Ignore .env files as they are local config
-                if file.startswith(".env"):
-                    continue
                 # Skip files larger than 1MB
                 try:
                     if file_path.stat().st_size > 1_000_000:

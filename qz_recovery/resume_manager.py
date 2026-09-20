@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import subprocess
+from qz_sandbox.backend import sanitize_subprocess_env
 from qz_tasks import SubtaskStatus, TaskStatus, get_manager
 from qz_tools import WORKSPACE
 
@@ -23,6 +24,7 @@ def get_current_head(workspace: str | Path | None = None) -> str | None:
             text=True,
             errors="replace",
             check=False,
+            env=sanitize_subprocess_env(str(ws)),
         )
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
@@ -42,6 +44,7 @@ def get_uncommitted_files(workspace: str | Path | None = None) -> list[str]:
             text=True,
             errors="replace",
             check=False,
+            env=sanitize_subprocess_env(str(ws)),
         )
         if res.returncode == 0 and res.stdout.strip():
             return [line.strip() for line in res.stdout.splitlines() if line.strip()]
@@ -122,6 +125,22 @@ class ResumeOutcome:
         }
 
 
+def _check_workspace_bound(task_id: str, requested_workspace: Path | str) -> dict[str, Any] | None:
+    manager = get_manager()
+    task = manager.get_task(task_id)
+    if task:
+        task_ws = task.get("workspace_path")
+        if task_ws:
+            canon_task_ws = Path(task_ws).resolve()
+            canon_req_ws = Path(requested_workspace).resolve()
+            if canon_task_ws != canon_req_ws:
+                raise ValueError(
+                    f"Cross-workspace recovery refused: task '{task_id}' is bound to workspace '{canon_task_ws}', "
+                    f"requested workspace is '{canon_req_ws}'."
+                )
+    return task
+
+
 class ResumeManager:
     """Coordinates workspace integrity checks and task resumption from DAG checkpoints."""
 
@@ -130,10 +149,10 @@ class ResumeManager:
 
     def get_resumable_state(self, task_id: str) -> ResumePlan:
         """Inspect task status, subtasks, and latest checkpoint to construct a ResumePlan."""
-        manager = get_manager()
-        task = manager.get_task(task_id)
+        task = _check_workspace_bound(task_id, self.workspace)
         if not task:
             raise ValueError(f"Task '{task_id}' not found.")
+        manager = get_manager()
 
         subtasks = manager.get_subtasks(task_id)
         latest_checkpoint = manager.get_latest_checkpoint(task_id)
@@ -179,6 +198,7 @@ class ResumeManager:
     ) -> IntegrityResult:
         """Check whether workspace git state matches the task's expected checkpoint commit."""
         ws = Path(workspace or self.workspace).resolve()
+        _check_workspace_bound(task_id, ws)
         latest_checkpoint = get_manager().get_latest_checkpoint(task_id)
         expected_commit = latest_checkpoint.get("git_commit_hash") if latest_checkpoint else None
 
@@ -236,6 +256,14 @@ class ResumeManager:
         """Execute a resume decision (RESUME, RESTART_CURRENT_SUBTASK, ROLLBACK, DISCARD)."""
         manager = get_manager()
         ws = Path(workspace or self.workspace).resolve()
+        try:
+            task = _check_workspace_bound(task_id, ws)
+        except ValueError as err:
+            return ResumeOutcome(
+                success=False,
+                action="BLOCKED",
+                message=str(err),
+            )
         manager.log_event(task_id, "RESUME_ATTEMPTED", {"decision": decision, "workspace": str(ws)})
 
         decision_upper = decision.upper()
@@ -379,9 +407,16 @@ class ResumeManager:
                 "affected_files": [],
             }
 
-        # Find target commit
+        # Find target commit and verify checkpoint ownership
         if checkpoint_id is not None:
             checkpoint = manager.get_checkpoint(checkpoint_id)
+            if checkpoint and str(checkpoint.get("task_id")) != str(task_id):
+                return {
+                    "can_rollback": False,
+                    "reason": "unowned_checkpoint",
+                    "message": f"Rollback blocked: checkpoint {checkpoint_id} does not belong to task {task_id}.",
+                    "affected_files": [],
+                }
         else:
             checkpoint = manager.get_latest_checkpoint(task_id)
 
@@ -401,6 +436,25 @@ class ResumeManager:
 
         target_ref = target_commit or "HEAD~1"
 
+        # Verify target is ancestor of current_head
+        anc_res = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", target_ref, current_head],
+            cwd=ws,
+            capture_output=True,
+            check=False,
+            env=sanitize_subprocess_env(str(ws)),
+        )
+        if anc_res.returncode != 0:
+            return {
+                "can_rollback": False,
+                "reason": "not_ancestor",
+                "message": f"Rollback blocked: target commit '{target_ref[:7]}' is not an ancestor of current HEAD '{current_head[:7]}'.",
+                "uncommitted_files": [],
+                "target_commit": target_ref,
+                "current_head": current_head,
+                "affected_files": [],
+            }
+
         try:
             res = subprocess.run(
                 ["git", "diff", "--numstat", target_ref, current_head],
@@ -409,6 +463,7 @@ class ResumeManager:
                 text=True,
                 errors="replace",
                 check=False,
+                env=sanitize_subprocess_env(str(ws)),
             )
             affected = []
             if res.returncode == 0:
@@ -465,6 +520,7 @@ class ResumeManager:
                 text=True,
                 errors="replace",
                 check=False,
+                env=sanitize_subprocess_env(str(ws)),
             )
             if res.returncode != 0:
                 return ResumeOutcome(

@@ -32,7 +32,7 @@ def _persist_event(task_id: str | None, event_type: str, payload: dict[str, Any]
 @dataclass(frozen=True)
 class ValidationReport:
     """Consolidated result across all validation checks for a task."""
-    status: str                         # "PASS" | "FAIL"
+    status: str                         # "PASS" | "FAIL" | "UNVERIFIED"
     checks: dict[str, CheckResult]      # check_name -> CheckResult
     summary: str
     required_checks: set[str] = field(default_factory=lambda: {"tests"})
@@ -40,13 +40,20 @@ class ValidationReport:
 
     @property
     def passed(self) -> bool:
-        return self.status == "PASS"
+        return self.status == "PASS" and not self.skipped_required_checks
 
     @property
     def failed_required_checks(self) -> list[str]:
         return [
             name for name, res in self.checks.items()
             if name in self.required_checks and res.status in (CheckStatus.FAIL, CheckStatus.ERROR)
+        ]
+
+    @property
+    def skipped_required_checks(self) -> list[str]:
+        return [
+            name for name, res in self.checks.items()
+            if name in self.required_checks and res.is_required and res.status in (CheckStatus.SKIPPED, CheckStatus.NOT_RUN, CheckStatus.UNVERIFIED)
         ]
 
     @property
@@ -61,6 +68,7 @@ class ValidationReport:
             "status": self.status,
             "passed": self.passed,
             "failed_required": self.failed_required_checks,
+            "skipped_required": self.skipped_required_checks,
             "failed_advisory": self.failed_advisory_checks,
             "checks": {k: v.to_dict() for k, v in self.checks.items()},
             "summary": self.summary,
@@ -164,12 +172,21 @@ class ValidationPipeline:
             k for k, v in checks.items()
             if k in self.required_checks and v.status in (CheckStatus.FAIL, CheckStatus.ERROR)
         ]
+        skipped_required = [
+            k for k, v in checks.items()
+            if k in self.required_checks and v.is_required and v.status in (CheckStatus.SKIPPED, CheckStatus.NOT_RUN, CheckStatus.UNVERIFIED)
+        ]
         failed_advisory = [
             k for k, v in checks.items()
             if k not in self.required_checks and v.status in (CheckStatus.FAIL, CheckStatus.ERROR)
         ]
 
-        overall_status = "FAIL" if failed_required else "PASS"
+        if failed_required:
+            overall_status = "FAIL"
+        elif skipped_required:
+            overall_status = "UNVERIFIED"
+        else:
+            overall_status = "PASS"
 
         # Build formatted human-readable summary
         lines = [f"Validation Gate: {overall_status}"]
@@ -177,6 +194,8 @@ class ValidationPipeline:
             req_tag = "REQUIRED" if name in self.required_checks else "ADVISORY"
             lines.append(f"  - [{res.status.value}] {name.upper()} ({req_tag}): {res.summary}")
 
+        if skipped_required and overall_status == "UNVERIFIED":
+            lines.append(f"  Warning: Required check(s) could not be verified: {', '.join(skipped_required)}.")
         if failed_advisory and overall_status == "PASS":
             lines.append(f"  Note: {len(failed_advisory)} advisory check(s) had warnings ({', '.join(failed_advisory)}).")
 
@@ -194,6 +213,7 @@ class ValidationPipeline:
             "status": overall_status,
             "passed": report.passed,
             "failed_required": failed_required,
+            "skipped_required": skipped_required,
             "failed_advisory": failed_advisory,
         })
 

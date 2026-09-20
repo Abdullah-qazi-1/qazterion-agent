@@ -32,9 +32,10 @@ def detect_project_environment(path: str | os.PathLike[str]) -> ProjectEnvironme
     root = Path(path).resolve(); has = lambda name: (root / name).exists()
     protected = tuple(name for name, present in (("conda", has("environment.yml") or has("environment.yaml")), ("docker", has("Dockerfile") or has("docker-compose.yml") or has("compose.yml"))) if present)
     python = _interpreter(root); deps = tuple(name for name in ("requirements.txt", "pyproject.toml", "poetry.lock", "Pipfile") if has(name))
-    if python or deps or has("setup.py") or has("uv.lock") or has("tox.ini"):
-        manager = "poetry" if has("poetry.lock") else "pipenv" if has("Pipfile") else "uv" if has("uv.lock") else "tox" if has("tox.ini") else "pip" if deps else "existing-venv"
-        test_cmd = (f"& '{python}' -m pytest" if os.name == "nt" else f"'{python}' -m pytest") if python else "python -m pytest"
+    has_py = any(root.glob("*.py")) or any(root.glob("*/*.py")) or (root / "tests").is_dir() or (root / "src").is_dir()
+    if python or deps or has("setup.py") or has("uv.lock") or has("tox.ini") or has_py:
+        manager = "poetry" if has("poetry.lock") else "pipenv" if has("Pipfile") else "uv" if has("uv.lock") else "tox" if has("tox.ini") else "pip" if deps else ("existing-venv" if python else "pip")
+        test_cmd = (f"& '{python}' -m pytest" if os.name == "nt" else f"'{python}' -m pytest") if python else "python -m unittest discover -s tests"
         return ProjectEnvironment(root, "python", manager, python, deps, protected, test_cmd)
     for marker, kind, manager, test in (("package.json", "node", "npm", "npm test"), ("Cargo.toml", "rust", "cargo", "cargo test"), ("go.mod", "go", "go", "go test ./..."), ("pom.xml", "java", "maven", "mvn test"), ("build.gradle", "java", "gradle", "gradle test"), ("build.gradle.kts", "java", "gradle", "gradle test")):
         if has(marker): return ProjectEnvironment(root, kind, manager, None, (), protected, test)
@@ -50,11 +51,13 @@ def preparation_plan(env: ProjectEnvironment) -> str:
 def prepare_python_environment(env: ProjectEnvironment, *, approved: bool = False) -> str:
     """Create `.venv` and install requirements only after explicit approval."""
     if not env.can_create_venv or not approved: return preparation_plan(env)
+    from qz_sandbox.backend import sanitize_subprocess_env
+    clean_env = sanitize_subprocess_env(str(env.workspace))
     target = env.workspace / ".venv"
-    made = subprocess.run([sys.executable, "-m", "venv", str(target)], cwd=env.workspace, capture_output=True, text=True, check=False)
+    made = subprocess.run([sys.executable, "-m", "venv", str(target)], cwd=env.workspace, capture_output=True, text=True, check=False, env=clean_env)
     if made.returncode: return "Environment creation failed: " + (made.stderr or made.stdout or "unknown error").strip()
     interpreter = target / ("Scripts/python.exe" if os.name == "nt" else "bin/python"); requirements = env.workspace / "requirements.txt"
     if not requirements.is_file(): return f"Environment created: {interpreter}. No requirements.txt was installed."
-    installed = subprocess.run([str(interpreter), "-m", "pip", "install", "-r", str(requirements)], cwd=env.workspace, capture_output=True, text=True, check=False)
+    installed = subprocess.run([str(interpreter), "-m", "pip", "install", "-r", str(requirements)], cwd=env.workspace, capture_output=True, text=True, check=False, env=clean_env)
     if installed.returncode: return "Dependencies failed to install: " + (installed.stderr or installed.stdout or "unknown error").strip()
     return f"Environment created and dependencies installed: {interpreter}"
