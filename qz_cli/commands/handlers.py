@@ -1,4 +1,4 @@
-﻿"""Status, Diff, Rollback, History, and Rules slash commands."""
+"""Status, Diff, Rollback, History, and Rules slash commands."""
 from __future__ import annotations
 
 import subprocess
@@ -46,12 +46,15 @@ def handle_status_command(console: Console, workspace: Path) -> None:
 
 def handle_diff_command(console: Console, workspace: Path) -> None:
     try:
+        from qz_sandbox.backend import sanitize_subprocess_env
+        clean_env = sanitize_subprocess_env(str(workspace))
         res = subprocess.run(
             ["git", "diff", "HEAD"],
             cwd=str(workspace),
             capture_output=True,
             text=True,
             timeout=5.0,
+            env=clean_env,
         )
         diff_out = res.stdout
         if not diff_out.strip():
@@ -62,6 +65,7 @@ def handle_diff_command(console: Console, workspace: Path) -> None:
                 capture_output=True,
                 text=True,
                 timeout=3.0,
+                env=clean_env,
             )
             if status_res.stdout.strip():
                 console.print(Panel(status_res.stdout, title="[bold yellow]Git Status (Untracked Files)[/bold yellow]", border_style="yellow"))
@@ -104,12 +108,18 @@ def handle_rollback_command(console: Console, workspace: Path, args: List[str]) 
     if args:
         target_cp = args[0]
         console.print(f"[bold yellow]Reverting workspace to checkpoint {target_cp}...[/bold yellow]")
-        # Git rollback logic
         try:
             matched = next((c for c in checkpoints if str(c["id"]) == target_cp or c["git_hash"].startswith(target_cp)), None)
             if matched:
-                subprocess.run(["git", "checkout", matched["git_hash"]], cwd=str(workspace), check=True)
-                console.print(f"[bold green]✔ Successfully reverted to {matched['git_hash'][:8]}.[/bold green]\n")
+                outcome = mgr.safe_rollback_to_checkpoint(
+                    task_id=str(matched["task_id"]),
+                    checkpoint_id=matched["id"],
+                    workspace=workspace,
+                )
+                if outcome.success:
+                    console.print(f"[bold green]✔ Successfully reverted: {outcome.message}[/bold green]\n")
+                else:
+                    console.print(f"[bold red]✖ Rollback blocked:[/bold red] {outcome.message}\n")
             else:
                 console.print(f"[red]Checkpoint {target_cp} not found.[/red]\n")
         except Exception as e:

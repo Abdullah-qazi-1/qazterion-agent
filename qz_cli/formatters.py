@@ -64,6 +64,8 @@ def render_completion_bar(console: Console, files_changed: int, tests_passed: in
 
 def render_permission_request(console: Console, action: str, details: Dict[str, Any]) -> str:
     """Prompt user for confirmation on dangerous operations."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return "deny"
     text = Text()
     text.append("Action: ", style="bold yellow")
     text.append(f"{action}\n", style="bold white")

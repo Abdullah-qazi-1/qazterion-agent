@@ -91,6 +91,8 @@ class QazterionCLI:
         bus.subscribe("*", on_event)
 
     def plan_approval_handler(self, plan_data: Dict[str, Any]) -> str:
+        if not sys.stdin or not sys.stdin.isatty():
+            return "reject"
         render_plan(self.console, plan_data.get("plan", ""), plan_data.get("architecture", ""))
         self.console.print("  [bold yellow]Proceed? [Y/n][/bold yellow] ", end="")
         try:
@@ -100,6 +102,8 @@ class QazterionCLI:
             return "reject"
 
     def permission_handler(self, req_data: Dict[str, Any]) -> str:
+        if not sys.stdin or not sys.stdin.isatty():
+            return "deny"
         return render_permission_request(self.console, req_data.get("action", ""), req_data.get("details", {}))
 
     def run_prompt(self, prompt: str) -> None:
@@ -126,8 +130,8 @@ class QazterionCLI:
         if res.get("status") == "completed":
             render_completion_bar(
                 self.console,
-                files_changed=max(1, self._files_modified_count),
-                tests_passed=self._tests_passed_count or 1,
+                files_changed=self._files_modified_count,
+                tests_passed=self._tests_passed_count,
                 duration_ms=res.get("latency_ms", 0),
             )
         elif res.get("status") == "cancelled":

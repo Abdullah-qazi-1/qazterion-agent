@@ -12,12 +12,14 @@ from qz_keystore import KeyStore
 
 def get_git_branch(workspace: Path) -> str:
     try:
+        from qz_sandbox.backend import sanitize_subprocess_env
         res = subprocess.run(
             ["git", "branch", "--show-current"],
             cwd=str(workspace),
             capture_output=True,
             text=True,
             timeout=2.0,
+            env=sanitize_subprocess_env(str(workspace)),
         )
         branch = res.stdout.strip()
         return f"{branch} ✓" if branch else "main ✓"

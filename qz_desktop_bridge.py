@@ -307,7 +307,16 @@ def _workspace(value: str | None) -> Path:
 
 
 def _git(workspace: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=workspace, capture_output=True, text=True, errors="replace", check=False)
+    from qz_sandbox.backend import sanitize_subprocess_env
+    return subprocess.run(
+        ["git", *args],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+        env=sanitize_subprocess_env(str(workspace)),
+    )
 
 
 def _diffs(workspace: Path) -> dict[str, list[dict[str, Any]]]:

@@ -122,9 +122,11 @@ _ENVIRONMENT_PREPARED = False
 
 
 def _ask_yes_no(prompt: str) -> bool:
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        return False
     try:
         answer = input(f"{prompt} [y/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
+    except (EOFError, KeyboardInterrupt, OSError, Exception):
         print()
         return False
     return answer in ("y", "yes")
@@ -170,17 +172,6 @@ def prepare_environment(auto_setup: bool = False):
 
     # Refresh qz_tools' cached interpreter selection now that setup (if any) is done.
     configure_project_environment(WORKSPACE)
-
-
-try:
-    from qz_keystore import KeyStore
-    _ks = KeyStore()
-    _ks_env = _ks.enabled_env()
-    for _k, _v in _ks_env.items():
-        if _k not in os.environ and _v:
-            os.environ[_k] = _v
-except Exception:
-    pass
 
 
 def run_task(task: str, auto_setup: bool = False):
