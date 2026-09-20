@@ -17,9 +17,14 @@ def _memory_path(workspace: str | Path) -> Path:
         local.parent.mkdir(parents=True, exist_ok=True)
         return local
     except OSError:
-        base = Path(os.environ.get("QAZTERION_DATA_DIR", Path.home() / ".qazterion"))
-        base.mkdir(parents=True, exist_ok=True)
-        return base / "project-memory.jsonl"
+        import hashlib
+        base = Path(os.environ.get("QAZTERION_DATA_DIR", Path.home() / ".qazterion")) / "memory"
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        ws_hash = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
+        return base / f"project-memory-{ws_hash}.jsonl"
 
 
 class ProjectMemory:

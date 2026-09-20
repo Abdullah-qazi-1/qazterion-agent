@@ -43,6 +43,7 @@ def get_current_head(workspace: str | None = None) -> str | None:
     """Return the current short or full git HEAD commit hash, or None if unavailable."""
     import subprocess
     from qz_tools import WORKSPACE
+    from qz_sandbox.backend import sanitize_subprocess_env
     from pathlib import Path
     ws = Path(workspace or WORKSPACE).resolve()
     try:
@@ -53,6 +54,7 @@ def get_current_head(workspace: str | None = None) -> str | None:
             text=True,
             errors="replace",
             check=False,
+            env=sanitize_subprocess_env(str(ws)),
         )
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
@@ -65,6 +67,7 @@ def get_uncommitted_files(workspace: str | None = None) -> list[str]:
     """Return list of modified, staged, or untracked files in the workspace."""
     import subprocess
     from qz_tools import WORKSPACE
+    from qz_sandbox.backend import sanitize_subprocess_env
     from pathlib import Path
     ws = Path(workspace or WORKSPACE).resolve()
     try:
@@ -75,6 +78,7 @@ def get_uncommitted_files(workspace: str | None = None) -> list[str]:
             text=True,
             errors="replace",
             check=False,
+            env=sanitize_subprocess_env(str(ws)),
         )
         if res.returncode == 0 and res.stdout.strip():
             return [line.strip() for line in res.stdout.splitlines() if line.strip()]
@@ -92,6 +96,7 @@ def commit_exists(commit_hash: str, workspace: str | None = None) -> bool:
     """Return True if the specified commit exists in git repository history."""
     import subprocess
     from qz_tools import WORKSPACE
+    from qz_sandbox.backend import sanitize_subprocess_env
     from pathlib import Path
     if not commit_hash:
         return False
@@ -104,6 +109,7 @@ def commit_exists(commit_hash: str, workspace: str | None = None) -> bool:
             text=True,
             errors="replace",
             check=False,
+            env=sanitize_subprocess_env(str(ws)),
         )
         return res.returncode == 0 and res.stdout.strip() == "commit"
     except Exception:

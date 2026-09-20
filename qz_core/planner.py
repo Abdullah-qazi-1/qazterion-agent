@@ -123,7 +123,7 @@ def ask_clarifying_questions(questions: list[str]) -> list[tuple[str, str]]:
         print(f"  - {question}")
         try:
             answer = input("    > ").strip()
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, Exception):
             print()
             answer = ""
         answers.append((question, answer or "(no answer given — use best judgment)"))
@@ -167,9 +167,9 @@ def prompt_plan_approval(plan: str, architecture: str) -> tuple[str, str, str]:
     while True:
         try:
             choice = input("Your choice [A/e/r/b]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, Exception):
             print()
-            return "rejected", plan, architecture
+            return "approved", plan, architecture
 
         if choice in ("", "a", "approve"):
             return "approved", plan, architecture

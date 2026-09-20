@@ -27,15 +27,14 @@ class QzToolsTests(unittest.TestCase):
         from qz_sandbox.manager import SandboxManager
 
         with patch("qz_tools.get_manager", return_value=SandboxManager(docker_available=False)):
-            with patch("qz_sandbox.backend.subprocess.run") as run:
-                run.return_value.returncode = 0
-                run.return_value.stdout = "done"
-                run.return_value.stderr = ""
+            with patch("qz_sandbox.backend.subprocess.Popen") as popen_mock:
+                popen_mock.return_value.communicate.return_value = ("done", "")
+                popen_mock.return_value.returncode = 0
                 result = qz_tools.run_command("Write-Output done")
 
         self.assertIn("exit_code=0", result)
-        self.assertEqual(run.call_args.args[0][:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
-        self.assertFalse(run.call_args.kwargs.get("shell", False))
+        self.assertEqual(popen_mock.call_args.args[0][:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
+        self.assertFalse(popen_mock.call_args.kwargs.get("shell", False))
 
     def test_workspace_file_tools_and_patch_handle_success_and_stale_context(self):
         with tempfile.TemporaryDirectory() as workspace:
@@ -147,7 +146,7 @@ class QzToolsTests(unittest.TestCase):
         self.assertTrue(summarized)
         self.assertEqual(len(condensed), 5)  # system, summary, and the latest three messages
         self.assertEqual(condensed[0], messages[0])
-        self.assertEqual(condensed[1]["role"], "system")
+        self.assertEqual(condensed[1]["role"], "user")
         self.assertIn("Steps 0-6 completed.", condensed[1]["content"])
         self.assertEqual([item["content"] for item in condensed[2:]], ["completed step 7", "completed step 8", "completed step 9"])
         self.assertEqual(create.call_args.kwargs["model"], "groq-fast")

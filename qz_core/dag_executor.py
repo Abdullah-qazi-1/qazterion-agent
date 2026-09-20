@@ -124,6 +124,9 @@ class DAGExecutionResult:
     summary: str = ""
     duration: float = 0.0
 
+    def __str__(self) -> str:
+        return self.summary
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "task_id": self.task_id,
@@ -193,7 +196,7 @@ class HardDAGExecutor:
 
         start_time = time.monotonic()
         complexity = classify_task_complexity(f"{overall_task}\n{node_title}\n{node_desc}")
-        model_alias, chosen_key = select_route(complexity, task_id=task_id)
+        model_alias, chosen_key = select_route(complexity, task_id=task_id, requires_tools=True)
 
         model_meta = None
         try:
@@ -280,9 +283,11 @@ class HardDAGExecutor:
         node_commands: list[str] = []
         node_tests: list[str] = []
         files_touched_set: set[str] = set()
+        agent_created_this_node: set[str] = set()
         test_changes_required = _task_requires_test_changes(f"{overall_task} {node_title}")
         test_file_changed = False
         last_turn_response = ""
+        execution_succeeded = True
 
         try:
             from qz_repair import RepairHistory, classify_failure
@@ -304,6 +309,8 @@ class HardDAGExecutor:
                 )
 
             # Node turn loop
+            model_request_error: str | None = None
+            execution_succeeded = True
             for iteration in range(self.max_node_iterations):
                 if self._is_task_cancelled(task_id):
                     break
@@ -329,12 +336,18 @@ class HardDAGExecutor:
                         active_model = used_model
                         log_event(task_id, "MODEL_FALLBACK", {"from": model_alias, "to": active_model})
                 except Exception as e:
+                    model_request_error = str(e)
                     print(f"\033[91m[node {node_id}]\033[0m Model request failed: {e}")
                     log_event(task_id, "NODE_ERROR", {"subtask_id": node_id, "error": str(e)})
                     break
 
                 msg = resp.choices[0].message
-                msg_dict = msg.model_dump(exclude_none=True)
+                if hasattr(msg, "model_dump"):
+                    msg_dict = msg.model_dump(exclude_none=True)
+                elif isinstance(msg, dict):
+                    msg_dict = msg
+                else:
+                    msg_dict = vars(msg)
                 clean_msg = {
                     k: v for k, v in msg_dict.items()
                     if k in ("role", "content", "tool_calls", "name", "tool_call_id", "function_call")
@@ -344,31 +357,54 @@ class HardDAGExecutor:
                 tool_calls = msg.tool_calls or []
                 if not tool_calls:
                     last_turn_response = msg.content or ""
+                    execution_succeeded = True
                     break
 
                 iteration_failed = None
                 for tool_call in tool_calls:
                     fname = tool_call.function.name
+                    parse_error = None
                     try:
                         args = json.loads(tool_call.function.arguments)
-                    except json.JSONDecodeError:
-                        args = {}
+                        if not isinstance(args, dict):
+                            parse_error = f"TOOL_ARGUMENT_ERROR: Expected JSON object for '{fname}', got {type(args).__name__}"
+                    except (json.JSONDecodeError, TypeError) as jde:
+                        parse_error = f"TOOL_ARGUMENT_ERROR: Malformed JSON arguments for tool '{fname}': {jde}"
 
                     tool_payload = {"tool": fname, "subtask_id": node_id}
-                    if fname == "run_command" and "command" in args:
+                    if parse_error is None and fname == "run_command" and "command" in args:
                         tool_payload["command"] = redact(str(args["command"]))
                     log_event(task_id, "TOOL_STARTED", tool_payload)
 
-                    func = TOOL_FUNCTIONS.get(fname)
-                    try:
-                        result = func(**args) if func else f"Unknown tool: {fname}"
-                    except (TypeError, ValueError, OSError) as e:
-                        result = f"Tool {fname} failed: {e}"
+                    if parse_error is not None:
+                        result = parse_error
+                        execution_succeeded = False
+                    else:
+                        func = TOOL_FUNCTIONS.get(fname)
+                        try:
+                            result = func(**args) if func else f"Unknown tool: {fname}"
+                        except (TypeError, ValueError, OSError) as e:
+                            result = f"Tool {fname} failed: {e}"
+                            execution_succeeded = False
+
+                    result_text = str(result)
+                    if result_text.startswith((
+                        "TOOL_ARGUMENT_ERROR",
+                        "Denied by security policy",
+                        "Could not apply",
+                        "Write refused",
+                        "Patch refused",
+                        "Command refused",
+                        "Tool ",
+                    )) or "[ISOLATION: DENIED" in result_text:
+                        execution_succeeded = False
+                    elif fname in ("write_file", "apply_patch", "run_command", "make_directory") and executor_mod._tool_result_failed(fname, result_text):
+                        execution_succeeded = False
 
                     log_event(task_id, "TOOL_FINISHED", {
                         "tool": fname,
                         "subtask_id": node_id,
-                        "ok": not str(result).startswith("Tool "),
+                        "ok": parse_error is None and not str(result).startswith("Tool ") and not str(result).startswith("TOOL_ARGUMENT_ERROR"),
                     })
 
                     # Track file changes for this node
@@ -382,6 +418,12 @@ class HardDAGExecutor:
                         node_changes.append({"path": changed_path, "kind": "new or rewritten file", "detail": args.get("content", "")})
                         files_touched_set.add(changed_path)
                         test_file_changed = test_file_changed or executor_mod._is_test_file_path(changed_path)
+                        try:
+                            full = (self.workspace / str(changed_path)).resolve()
+                            if str(full) in getattr(qz_tools, "_AGENT_CREATED_FILES", set()):
+                                agent_created_this_node.add(str(changed_path))
+                        except Exception:
+                            pass
 
                     if fname == "run_command":
                         cmd_str = str(args.get("command", "")).strip()
@@ -396,10 +438,12 @@ class HardDAGExecutor:
                         ):
                             iteration_failed = False
 
+                    from qz_security.injection_guard import wrap_untrusted_content
+                    safe_content = wrap_untrusted_content(str(result), label=f"tool_result_{fname}")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call.id,
-                        "content": str(result),
+                        "content": safe_content,
                     })
 
                 if iteration_failed is True:
@@ -409,11 +453,39 @@ class HardDAGExecutor:
 
                 if consecutive_failures >= 3 and not escalated:
                     prev_model = active_model
-                    escalated_alias, _ = select_route("reasoner", task_id=task_id)
+                    escalated_alias, _ = select_route("reasoner", task_id=task_id, requires_tools=True, requires_reasoning=True)
                     active_model = escalated_alias
                     escalated = True
                     consecutive_failures = 0
-                    log_event(task_id, "MODEL_FALLBACK", {"from": prev_model, "to": active_model, "reason": "node_escalation"})
+            if model_request_error is not None:
+                print(f"\033[91m[node {node_id}]\033[0m Execution aborted due to model error: {model_request_error}")
+                if attempt < self.max_node_retries:
+                    attempt += 1
+                    update_subtask_status(node_id, SubtaskStatus.RETRYING, attempts=attempt)
+                    continue
+                else:
+                    update_subtask_status(
+                        node_id,
+                        SubtaskStatus.FAILED,
+                        attempts=attempt,
+                        result_summary=f"Model request failed: {model_request_error}",
+                    )
+                    return NodeResult(
+                        node_id=node_id,
+                        status=SubtaskStatus.FAILED,
+                        summary=f"Model request failed: {model_request_error}",
+                        files_changed=node_changes,
+                        commands_executed=node_commands,
+                        tests_run=node_tests,
+                        validation_result={"status": "FAIL", "error": model_request_error},
+                        duration=time.monotonic() - start_time,
+                        model_used=active_model,
+                        provider_id=provider_id,
+                        model_id=model_id,
+                        model_display_name=model_display_name,
+                        key_identity=key_identity,
+                        attempts=attempt,
+                    )
 
             # Validation Gate for this node
             _persist_task(task_id, lambda: update_status(task_id, TaskStatus.VALIDATING, current_step=f"validating node {node_id}"))
@@ -425,8 +497,8 @@ class HardDAGExecutor:
                 client=self.client,
             )
 
-            if val_report.passed:
-                # Validation passed -> Node is complete
+            if val_report.passed and execution_succeeded and not getattr(val_report, "skipped_required_checks", []):
+                # Validation passed and execution succeeded -> Node is complete
                 # Commit checkpoint strictly for files touched by this node
                 touched_list = sorted(files_touched_set)
                 commit_hash = None
@@ -494,10 +566,31 @@ class HardDAGExecutor:
                 try:
                     from qz_repair import classify_failure
                     classified = classify_failure(val_report, raw_command_output=node_commands[-1] if node_commands else None)
-                    anti_loop = repair_history.get_anti_loop_feedback(classified.diagnostics.error_signature) if repair_history else ""
+                    current_diff = "\n".join(str(c.get("detail", "")) for c in node_changes)
+                    anti_loop = repair_history.get_anti_loop_feedback(classified.diagnostics.error_signature, current_diff=current_diff) if repair_history else ""
                     repair_prompt = classified.format_for_repair_prompt(attempt, self.max_node_retries, history_feedback=anti_loop)
                     if repair_history:
-                        repair_history.record_attempt(attempt, classified.category, classified.diagnostics.error_signature)
+                        repair_history.record_attempt(attempt, classified.category, classified.diagnostics.error_signature, diff_text=current_diff)
+                    
+                    # Rollback touched files if a repeated loop is detected or on catastrophic build failure
+                    if anti_loop or (classified and classified.category.value == "build_failure"):
+                        touched_files = [f for f in files_touched_set if f and f != "unknown"]
+                        if touched_files:
+                            try:
+                                import subprocess
+                                from qz_sandbox.backend import sanitize_subprocess_env
+                                subprocess.run(
+                                    ["git", "checkout", "HEAD", "--"] + touched_files,
+                                    cwd=str(self.workspace),
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=10.0,
+                                    env=sanitize_subprocess_env(str(self.workspace)),
+                                )
+                                repair_prompt += f"\n\n[System Safety Rollback]: Touched files ({', '.join(touched_files)}) have been reset to the clean checkpoint baseline to avoid compounding bad edits. Please start fresh."
+                            except Exception:
+                                pass
+
                     log_event(task_id, "REPAIR_ATTEMPT", {
                         "subtask_id": node_id,
                         "attempt": attempt,
@@ -522,51 +615,52 @@ class HardDAGExecutor:
                     "content": repair_prompt,
                 })
                 continue
-            else:
-                # Retries exhausted -> Node permanently failed
-                error_summary = f"Validation failed after {attempt} attempt(s): {', '.join(val_report.failed_required_checks)}"
-                update_subtask_status(
-                    node_id,
-                    SubtaskStatus.FAILED,
-                    result_summary=error_summary,
-                    files_touched=sorted(files_touched_set),
-                    attempts=attempt,
-                )
-                log_event(task_id, "NODE_FAILED", {
-                    "subtask_id": node_id,
-                    "title": node_title,
-                    "error": error_summary,
-                    "attempts": attempt,
-                })
-                log_event(task_id, "SUBTASK_FAILED", {
-                    "subtask_id": node_id,
-                    "title": node_title,
-                    "error": error_summary,
-                    "attempts": attempt,
-                })
-                log_event(task_id, "dag.node.failed", {
-                    "subtask_id": node_id,
-                    "title": node_title,
-                    "error": error_summary,
-                })
 
-                return NodeResult(
-                    node_id=node_id,
-                    status=SubtaskStatus.FAILED,
-                    summary=f"Failed: {error_summary}",
-                    files_changed=node_changes,
-                    commands_executed=node_commands,
-                    tests_run=node_tests,
-                    validation_result=val_report.to_dict(),
-                    error=error_summary,
-                    duration=time.monotonic() - start_time,
-                    model_used=active_model,
-                    provider_id=provider_id,
-                    model_id=model_id,
-                    model_display_name=model_display_name,
-                    key_identity=key_identity,
-                    attempts=attempt,
-                )
+            # Retries exhausted -> Node permanently failed
+            failing_reasons = getattr(val_report, "failed_required_checks", []) or (["unverified required checks"] if getattr(val_report, "skipped_required_checks", []) else ["execution errors encountered"])
+            error_summary = f"Validation failed after {attempt} attempt(s): {', '.join(failing_reasons)}"
+            update_subtask_status(
+                node_id,
+                SubtaskStatus.FAILED,
+                result_summary=error_summary,
+                files_touched=sorted(files_touched_set),
+                attempts=attempt,
+            )
+            log_event(task_id, "NODE_FAILED", {
+                "subtask_id": node_id,
+                "title": node_title,
+                "error": error_summary,
+                "attempts": attempt,
+            })
+            log_event(task_id, "SUBTASK_FAILED", {
+                "subtask_id": node_id,
+                "title": node_title,
+                "error": error_summary,
+                "attempts": attempt,
+            })
+            log_event(task_id, "dag.node.failed", {
+                "subtask_id": node_id,
+                "title": node_title,
+                "error": error_summary,
+            })
+
+            return NodeResult(
+                node_id=node_id,
+                status=SubtaskStatus.FAILED,
+                summary=f"Failed: {error_summary}",
+                files_changed=node_changes,
+                commands_executed=node_commands,
+                tests_run=node_tests,
+                validation_result=val_report.to_dict(),
+                error=error_summary,
+                duration=time.monotonic() - start_time,
+                model_used=active_model,
+                provider_id=provider_id,
+                model_id=model_id,
+                model_display_name=model_display_name,
+                key_identity=key_identity,
+                attempts=attempt,
+            )
 
         return NodeResult(
             node_id=node_id,

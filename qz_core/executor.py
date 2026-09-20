@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from openai import OpenAI
 
@@ -57,6 +59,12 @@ def request_completion(*, model: str, messages: list[dict], tools=None, temperat
     pool = get_pool()
     router = get_router()
 
+    # Pre-request admission check against task budget limits
+    if tracker is not None and task_id:
+        admitted, block_reason = tracker.admit_request(task_id)
+        if not admitted:
+            raise RuntimeError(f"Request blocked by task budget: {block_reason}")
+
     candidate_aliases = list(fallbacks) if fallbacks is not None else [model]
 
     # Filter out aliases/keys flagged in usage_tracker unless all are flagged
@@ -78,25 +86,44 @@ def request_completion(*, model: str, messages: list[dict], tools=None, temperat
         exclude=excluded,
         fallbacks=tuple(candidate_aliases),
         task_id=task_id,
+        requires_tools=(tools is not None),
+        requires_reasoning=(model == "reasoner" or "reason" in model.lower()),
     )
 
     failures = []
+    limiter = getattr(pool, "concurrency", None)
+
     for candidate, candidate_key, _ in ranked_routes:
+        raw_key = None
+        if candidate_key:
+            try:
+                raw_key = pool.registry.get_key_value(candidate_key)
+            except Exception:
+                pass
+
         for attempt in range(MODEL_REQUEST_ATTEMPTS):
+            request_id = str(uuid.uuid4())
             started = time.monotonic()
+            slot_ctx = limiter.slot(candidate_key) if (limiter and candidate_key) else contextlib.nullcontext()
             try:
                 kwargs = {"model": candidate, "messages": messages, "temperature": temperature}
                 if tools is not None:
                     kwargs["tools"] = tools
                 if max_tokens is not None:
                     kwargs["max_tokens"] = max_tokens
-                response = c.chat.completions.create(**kwargs)
+                if raw_key:
+                    kwargs["api_key"] = raw_key
+
+                with slot_ctx:
+                    response = c.chat.completions.create(**kwargs)
+
                 if not response.choices:
                     raise RuntimeError("provider returned no choices")
                 message = response.choices[0].message
                 if not (getattr(message, "content", None) or getattr(message, "tool_calls", None)):
                     raise RuntimeError("provider returned an empty assistant message")
                 duration = time.monotonic() - started
+                actual_model = getattr(response, "model", None) or candidate
                 usage_obj = getattr(response, "usage", None)
                 in_tokens = int(getattr(usage_obj, "prompt_tokens", 0) or 0) if usage_obj else 0
                 out_tokens = int(getattr(usage_obj, "completion_tokens", 0) or 0) if usage_obj else 0
@@ -128,7 +155,7 @@ def request_completion(*, model: str, messages: list[dict], tools=None, temperat
                     pass
 
                 tracker.record_request(
-                    model=candidate,
+                    model=actual_model,
                     provider=prov_id,
                     key_id=candidate_key,
                     task_id=task_id,
@@ -141,7 +168,23 @@ def request_completion(*, model: str, messages: list[dict], tools=None, temperat
                     fallback_from=model if candidate != model else None,
                     task_type="coding",
                     retry_count=attempt,
+                    request_id=request_id,
                 )
+                try:
+                    from qz_storage import get_storage
+                    get_storage().record_model_call(
+                        provider=prov_id or "unknown",
+                        model=actual_model,
+                        input_tokens=in_tokens,
+                        output_tokens=out_tokens,
+                        latency_ms=duration * 1000.0,
+                        success=True,
+                        error=None,
+                        task_id=task_id,
+                    )
+                except Exception:
+                    pass
+
                 tracker.clear_flag(candidate)
                 if candidate_key:
                     tracker.clear_flag(candidate_key)
@@ -163,16 +206,57 @@ def request_completion(*, model: str, messages: list[dict], tools=None, temperat
                 return response, candidate
             except Exception as error:
                 duration = time.monotonic() - started
+                failed_in_tokens = 0
+                try:
+                    from qz_context import estimate_tokens
+                    failed_in_tokens = estimate_tokens(json.dumps(messages, default=str))
+                except Exception:
+                    pass
+
+                prov_id = None
+                try:
+                    from qz_providers.model_registry import get_model_registry
+                    model_reg = get_model_registry()
+                    meta = model_reg.get_model_by_alias(candidate)
+                    if meta:
+                        prov_id = meta.provider
+                except Exception:
+                    pass
+
+                redacted_err = redact(str(error))
+
                 tracker.record_request(
                     model=candidate,
+                    provider=prov_id,
                     key_id=candidate_key,
+                    task_id=task_id,
                     duration=duration,
                     success=False,
-                    error=str(error),
+                    input_tokens=failed_in_tokens,
+                    output_tokens=0,
+                    total_tokens=failed_in_tokens,
+                    is_estimated=True if failed_in_tokens > 0 else False,
+                    error=redacted_err,
                     fallback_from=model if candidate != model else None,
                     task_type="coding",
                     retry_count=attempt,
+                    request_id=request_id,
                 )
+                try:
+                    from qz_storage import get_storage
+                    get_storage().record_model_call(
+                        provider=prov_id or "unknown",
+                        model=candidate,
+                        input_tokens=failed_in_tokens,
+                        output_tokens=0,
+                        latency_ms=duration * 1000.0,
+                        success=False,
+                        error=redacted_err,
+                        task_id=task_id,
+                    )
+                except Exception:
+                    pass
+
                 err_type = "other"
                 try:
                     err_type = pool.health_manager.classify_error(error)
@@ -180,7 +264,7 @@ def request_completion(*, model: str, messages: list[dict], tools=None, temperat
                         candidate_key,
                         error_type=err_type,
                         latency_ms=duration * 1000.0,
-                        error_message=str(error),
+                        error_message=redacted_err,
                     )
                 except Exception:
                     pass
@@ -201,9 +285,12 @@ def request_completion(*, model: str, messages: list[dict], tools=None, temperat
                     tracker.mark_rate_limited(candidate)
                     if candidate_key:
                         tracker.mark_rate_limited(candidate_key)
-                failures.append(f"{candidate} ({candidate_key}) attempt {attempt + 1}: {error}")
+                failures.append(f"{candidate} ({candidate_key}) attempt {attempt + 1}: {redacted_err}")
                 if err_type == "auth_error":
                     # Permanent auth error - do not retry with the same key
+                    break
+                if failure_kind in ("rate_limited", "quota_exhausted"):
+                    # Rate limit or quota exhausted - fail over immediately to next candidate/key
                     break
                 if attempt + 1 < MODEL_REQUEST_ATTEMPTS:
                     time.sleep(attempt + 1)
@@ -356,9 +443,11 @@ def roll_conversation_summary(messages: list[dict], client: OpenAI | None = None
     if not summary:
         return messages, False
 
+    from qz_security.injection_guard import wrap_untrusted_content
+    wrapped_summary = wrap_untrusted_content(summary, label="CONVERSATION_HISTORY_SUMMARY")
     condensed = [
         messages[0],
-        {"role": "system", "content": f"Earlier executor progress summary:\n{summary}"},
+        {"role": "user", "content": f"[Earlier executor progress summary (untrusted state)]:\n{wrapped_summary}"},
         *messages[recent_start:],
     ]
     return condensed, True

@@ -4,6 +4,7 @@ For safety, every operation is restricted to the CURRENT WORKING DIRECTORY
 — the directory where the terminal is opened is the workspace.
 """
 
+import hashlib
 import os
 import re
 import shlex
@@ -20,12 +21,53 @@ from qz_security.workspace_guard import resolve_workspace_path
 
 WORKSPACE = os.getcwd()
 _PROJECT_PYTHON: str | None = None
+_FILE_SNAPSHOTS: dict[str, str] = {}
+_AGENT_CREATED_FILES: set[str] = set()
+_AGENT_COMMIT_HASHES: set[str] = set()
 
 
-def configure_project_environment(workspace: str | os.PathLike[str] = WORKSPACE) -> ProjectEnvironment:
+def _current_workspace() -> str:
+    try:
+        from qz_core.common import get_task_context
+        ctx = get_task_context()
+        if ctx is not None:
+            return str(ctx.workspace)
+    except Exception:
+        pass
+    return WORKSPACE
+
+
+def _file_sha256(path: str) -> str | None:
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _refuse_stale_write(full: str, path: str) -> str | None:
+    """Refuse overwrite when the file changed since the last agent read/write."""
+    if not os.path.exists(full):
+        return None
+    current = _file_sha256(full)
+    expected = _FILE_SNAPSHOTS.get(full)
+    if expected is None:
+        return (
+            f"Write refused: '{path}' exists and was not read or written by the agent in this task. "
+            "Read the file first, then write."
+        )
+    if current is not None and current != expected:
+        return (
+            f"Write refused: '{path}' changed since the last agent read/write "
+            "(concurrent or external modification)."
+        )
+    return None
+
+
+def configure_project_environment(workspace: str | os.PathLike[str] | None = None) -> ProjectEnvironment:
     """Select a detected project interpreter without changing the project."""
     global _PROJECT_PYTHON
-    environment = detect_project_environment(workspace)
+    environment = detect_project_environment(workspace or _current_workspace())
     _PROJECT_PYTHON = str(environment.python_interpreter) if environment.python_interpreter else None
     return environment
 
@@ -34,7 +76,7 @@ _SENSITIVE_GIT_SUFFIXES = (".pem", ".key", ".p12", ".pfx")
 
 
 def _safe_path(path: str) -> str:
-    return str(resolve_workspace_path(path, WORKSPACE))
+    return str(resolve_workspace_path(path, _current_workspace()))
 
 
 def list_files(directory: str = ".", path: str | None = None) -> str:
@@ -44,46 +86,70 @@ def list_files(directory: str = ".", path: str | None = None) -> str:
     return security_execute("list_files", args)
 
 
-def _impl_list_files(directory: str = ".", path: str | None = None) -> str:
-    """List files/folders under a directory (default: workspace root).
-
-    ``path`` is accepted as an alias for ``directory``: models routinely guess
-    ``path`` here since every other file tool (read_file, write_file, apply_patch)
-    uses that name, and rejecting it just burns an iteration on a predictable
-    mistake for no benefit.
-    """
+def _impl_list_files(directory: str = ".", path: str | None = None, max_entries: int = 200) -> str:
+    """List files/folders under a directory (default: workspace root) with bounded output."""
     if path is not None and directory == ".":
         directory = path
     target = _safe_path(directory)
     if not os.path.exists(target):
         return f"Directory not found: {directory}"
     lines = []
+    total_count = 0
     for root, dirs, files in os.walk(target):
         dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__", "venv", ".venv")]
         rel_root = os.path.relpath(root, target)
-        for f in files:
-            rel_path = os.path.join(rel_root, f) if rel_root != "." else f
-            lines.append(rel_path)
+        for f in sorted(files):
+            total_count += 1
+            if len(lines) < max_entries:
+                rel_path = os.path.join(rel_root, f) if rel_root != "." else f
+                lines.append(rel_path)
+    if total_count > max_entries:
+        lines.append(f"... [Truncated: showing first {max_entries} of {total_count} files/directories. Use subdirectory path to narrow search]")
     return "\n".join(lines) if lines else "(empty)"
 
 
-def read_file(path: str) -> str:
-    return security_execute("read_file", {"path": path})
+def read_file(path: str, start_line: int | None = None, end_line: int | None = None) -> str:
+    args: dict = {"path": path}
+    if start_line is not None:
+        args["start_line"] = start_line
+    if end_line is not None:
+        args["end_line"] = end_line
+    return security_execute("read_file", args)
 
 
-def _impl_read_file(path: str) -> str:
-    """Return file content with 1-based line numbers so apply_patch hunk headers
-    and context lines can be built accurately instead of guessed by eye.
-
-    The numbering (e.g. "  12\t") is a reference aid only — it is NOT part of the
-    file and must never be typed into an apply_patch diff's context/`-`/`+` lines.
+def _impl_read_file(path: str, start_line: int | None = None, end_line: int | None = None, max_lines: int = 2000) -> str:
+    """Return bounded file content with 1-based line numbers.
+    
+    Supports pagination with start_line and end_line parameters to protect context budget.
     """
     full = _safe_path(path)
     if not os.path.exists(full):
         return f"File not found: {path}"
-    with open(full, "r", errors="ignore") as f:
-        lines = f.readlines()
-    numbered = "".join(f"{i:>5}\t{line}" for i, line in enumerate(lines, start=1))
+    try:
+        with open(full, "r", errors="ignore") as f:
+            lines = f.readlines()
+        with open(full, "rb") as f_bytes:
+            _FILE_SNAPSHOTS[full] = hashlib.sha256(f_bytes.read()).hexdigest()
+    except Exception as e:
+        return f"Error reading file {path}: {e}"
+
+    total_lines = len(lines)
+    s = max(1, int(start_line)) if start_line is not None else 1
+    e = min(total_lines, int(end_line)) if end_line is not None else total_lines
+    if s > total_lines:
+        return f"(empty range: file has {total_lines} lines, requested start line is {s})"
+    if e < s:
+        e = s
+
+    is_truncated = False
+    if (e - s + 1) > max_lines:
+        e = s + max_lines - 1
+        is_truncated = True
+
+    selected_lines = lines[s - 1:e]
+    numbered = "".join(f"{i:>5}\t{line}" for i, line in enumerate(selected_lines, start=s))
+    if is_truncated or (start_line is None and end_line is None and total_lines > max_lines):
+        numbered += f"\n... [TRUNCATED: Showing lines {s}-{e} of {total_lines}. Use read_file with start_line/end_line to view remaining lines]"
     return numbered if lines else ""
 
 
@@ -93,10 +159,17 @@ def write_file(path: str, content: str) -> str:
 
 def _impl_write_file(path: str, content: str) -> str:
     full = _safe_path(path)
+    existed = os.path.exists(full)
+    stale = _refuse_stale_write(full, path)
+    if stale:
+        return stale
     if os.path.dirname(full):
         os.makedirs(os.path.dirname(full), exist_ok=True)
-    with open(full, "w") as f:
+    with open(full, "w", encoding="utf-8", newline="") as f:
         f.write(content)
+    _FILE_SNAPSHOTS[full] = _file_sha256(full)
+    if not existed:
+        _AGENT_CREATED_FILES.add(full)
     return f"Written: {path} ({len(content)} chars)"
 
 
@@ -117,7 +190,7 @@ def search_index(query: str, limit: int = 3) -> str:
 def _impl_search_index(query: str, limit: int = 3) -> str:
     """Find source files relevant to a task without reading the complete codebase."""
     try:
-        index, _ = load_or_build_index(WORKSPACE)
+        index, _ = load_or_build_index(_current_workspace())
         return format_search_results(find_in_index(index, query, limit=int(limit)))
     except (OSError, ValueError, TypeError) as e:
         return f"Index search failed: {e}"
@@ -130,7 +203,7 @@ def read_relevant_chunks(query: str, limit: int = 3) -> str:
 def _impl_read_relevant_chunks(query: str, limit: int = 3) -> str:
     """Read only relevant code ranges, leaving full-file reads available by choice."""
     try:
-        index, _ = load_or_build_index(WORKSPACE)
+        index, _ = load_or_build_index(_current_workspace())
         chunks = find_chunks(index, query, limit=int(limit))
         if not chunks:
             return "No relevant code chunks found. Try search_index or read_file for broader context."
@@ -171,10 +244,20 @@ def _parse_hunks(diff_text: str):
         if m:
             if current is not None:
                 hunks.append(current)
-            current = {"old_start": int(m.group(1)), "lines": []}
+            old_start = int(m.group(1))
+            old_count = int(m.group(2)) if m.group(2) is not None else 1
+            new_start = int(m.group(3))
+            new_count = int(m.group(4)) if m.group(4) is not None else 1
+            current = {
+                "old_start": old_start,
+                "old_count": old_count,
+                "new_start": new_start,
+                "new_count": new_count,
+                "lines": [],
+            }
             continue
         if current is None:
-            # Ignore file headers and other content before the first hunk.
+            # Ignore file headers (---, +++) before the first hunk.
             continue
         if line.startswith("\\"):
             # "\ No newline at end of file" — ignore
@@ -183,6 +266,25 @@ def _parse_hunks(diff_text: str):
             current["lines"].append(line)
     if current is not None:
         hunks.append(current)
+
+    for idx, h in enumerate(hunks):
+        old_seen = sum(1 for line in h["lines"] if line[:1] in (" ", "-"))
+        new_seen = sum(1 for line in h["lines"] if line[:1] in (" ", "+"))
+        if old_seen != h["old_count"] or new_seen != h["new_count"]:
+            raise ValueError(
+                f"Hunk line count mismatch at hunk {idx + 1}: declared "
+                f"-{h['old_count']} +{h['new_count']} but found {old_seen} old / {new_seen} new lines"
+            )
+
+    # Validate hunks against malformed/overlapping/duplicate ranges
+    for idx, h in enumerate(hunks):
+        if h["old_start"] < 0 or h["new_start"] < 0:
+            raise ValueError(f"Invalid negative line number in hunk {idx + 1}")
+        if idx > 0:
+            prev = hunks[idx - 1]
+            prev_end = prev["old_start"] + max(0, prev["old_count"] - 1)
+            if h["old_start"] <= prev_end and not (prev["old_count"] == 0 and h["old_start"] == prev["old_start"]):
+                raise ValueError(f"Overlapping or duplicate hunk detected at line {h['old_start']}")
     return hunks
 
 
@@ -262,6 +364,10 @@ def _impl_apply_patch(path: str, diff: str) -> str:
     if not os.path.exists(full):
         return f"File not found: {path} (use write_file for a new file, not apply_patch)"
 
+    stale = _refuse_stale_write(full, path)
+    if stale:
+        return stale.replace("Write refused", "Patch refused", 1)
+
     with open(full, "r", errors="ignore") as f:
         original_lines = f.readlines()
 
@@ -271,9 +377,10 @@ def _impl_apply_patch(path: str, diff: str) -> str:
     except Exception as e:
         return f"Could not apply patch: {e}. Read the complete file again with read_file and create a correct diff."
 
-    with open(full, "w") as f:
+    with open(full, "w", encoding="utf-8", newline="") as f:
         f.writelines(patched_lines)
 
+    _FILE_SNAPSHOTS[full] = _file_sha256(full)
     old_count, new_count = len(original_lines), len(patched_lines)
     return f"Patch applied: {path} ({old_count} → {new_count} lines)"
 
@@ -294,11 +401,12 @@ def _impl_run_command(command: str, timeout: int = 60) -> str:
     """
     try:
         if _PROJECT_PYTHON is None:
-            configure_project_environment(WORKSPACE)
+            configure_project_environment(_current_workspace())
         timeout = max(1, min(int(timeout), 300))
         is_windows = os.name == "nt"
         manager = get_manager()
         using_docker = manager.docker_available
+        workspace = _current_workspace()
         # Host-python rewrite is only valid on the host backend. A Docker
         # container has its own interpreter at /usr/local/bin/python.
         if not using_docker:
@@ -313,7 +421,7 @@ def _impl_run_command(command: str, timeout: int = 60) -> str:
                 else:
                     quoted_interpreter = shlex.quote(interpreter)
                     command = re.sub(r"^\s*python(?:\.exe)?", lambda _match: quoted_interpreter, command, count=1, flags=re.IGNORECASE)
-        result = manager.execute(command, WORKSPACE, timeout)
+        result = manager.execute(command, workspace, timeout)
         if result.timed_out:
             return f"Command did not complete within {timeout}s (timeout)."
         if result.error and not result.timed_out and result.exit_code == -1 and not result.stdout and not result.stderr:
@@ -348,12 +456,24 @@ def _impl_run_command(command: str, timeout: int = 60) -> str:
                 retry_command = f"& '{quoted_interpreter}' -c '{quoted_script}'"
             else:
                 retry_command = f"{shlex.quote(_PROJECT_PYTHON or sys.executable)} -c {shlex.quote(compatibility_runner)}"
-            result = manager.execute(retry_command, WORKSPACE, timeout)
+            result = manager.execute(retry_command, workspace, timeout)
             if result.timed_out:
                 return f"Command did not complete within {timeout}s (timeout)."
             if result.error and not result.timed_out and result.exit_code == -1 and not result.stdout and not result.stderr:
                 return f"Could not start command: {result.error}"
-        output = f"exit_code={result.exit_code}\n"
+        isolation_tag = f"[ISOLATION: {result.isolation or ('docker' if using_docker else 'UNSANDBOXED')}"
+        if result.fallback_reason:
+            isolation_tag += f" ({result.fallback_reason})"
+        isolation_tag += "]"
+
+        if result.isolation == "DENIED" or (result.error and str(result.error).startswith("ISOLATION_DENIED")):
+            return (
+                f"exit_code={result.exit_code}\n{isolation_tag}\n"
+                f"Command refused: isolation is unavailable or incomplete. "
+                f"{result.error or result.stderr or 'Sandbox required.'}\n"
+            )
+
+        output = f"exit_code={result.exit_code}\n{isolation_tag}\n"
         output += f"STDOUT:\n{result.stdout[-3000:]}\n"
         if result.stderr:
             output += f"STDERR:\n{result.stderr[-3000:]}\n"
@@ -368,14 +488,16 @@ def _impl_run_command(command: str, timeout: int = 60) -> str:
 # ============================================================
 
 def _run_git(args: list[str]) -> subprocess.CompletedProcess:
-    """Run Git in the agent workspace without a shell."""
+    """Run Git in the agent workspace without a shell with scrubbed environment."""
+    from qz_sandbox.backend import sanitize_subprocess_env
     return subprocess.run(
         ["git", *args],
-        cwd=WORKSPACE,
+        cwd=_current_workspace(),
         capture_output=True,
         text=True,
         errors="replace",
         check=False,
+        env=sanitize_subprocess_env(_current_workspace()),
     )
 
 
@@ -414,7 +536,7 @@ def ensure_git_repository() -> str:
 def _commit_safe_path(path: str) -> str:
     """Return a validated, non-sensitive pathspec relative to the workspace."""
     full = Path(_safe_path(path))
-    workspace = Path(WORKSPACE).resolve()
+    workspace = Path(_current_workspace()).resolve()
     relative = full.resolve().relative_to(workspace).as_posix()
     name = full.name.lower()
     if name in _SENSITIVE_GIT_NAMES or name.endswith(_SENSITIVE_GIT_SUFFIXES):
@@ -441,6 +563,26 @@ def commit_changes(paths: list[str], message: str) -> str:
     except ValueError as error:
         return f"Git commit skipped: {error}"
 
+    for path in safe_paths:
+        full = _safe_path(path)
+        snapshot = _FILE_SNAPSHOTS.get(full)
+        if snapshot is None:
+            return (
+                f"Git commit skipped: '{path}' has no agent snapshot. "
+                "Only files read or written by the agent in this task may be committed."
+            )
+        if os.path.exists(full):
+            try:
+                with open(full, "rb") as f_bytes:
+                    current_h = hashlib.sha256(f_bytes.read()).hexdigest()
+                if current_h != snapshot:
+                    return (
+                        f"Git commit skipped: unexpected concurrent modification in '{path}'. "
+                        "Current file state does not match agent changes."
+                    )
+            except OSError as err:
+                return f"Git commit skipped: could not verify file snapshot for '{path}': {err}"
+
     added = _run_git(["add", "--", *safe_paths])
     if added.returncode != 0:
         return f"Git stage failed: {_git_error(added)}"
@@ -456,6 +598,10 @@ def commit_changes(paths: list[str], message: str) -> str:
     if committed.returncode != 0:
         return f"Git commit failed: {_git_error(committed)}"
     commit_id = _run_git(["rev-parse", "--short", "HEAD"])
+    full_hash = _run_git(["rev-parse", "HEAD"])
+    if full_hash.returncode == 0 and full_hash.stdout.strip():
+        _AGENT_COMMIT_HASHES.add(full_hash.stdout.strip())
+        _AGENT_COMMIT_HASHES.add(commit_id.stdout.strip())
     return f"Git commit created: {commit_id.stdout.strip()} — {normalized_message}"
 
 
@@ -483,6 +629,21 @@ def _impl_rollback_last_change() -> str:
     parent = _run_git(["rev-parse", "HEAD~1"])
     if parent.returncode != 0:
         return "Rollback unavailable: the repository needs at least two commits."
+
+    current = _run_git(["rev-parse", "HEAD"])
+    if current.returncode != 0 or not current.stdout.strip():
+        return "Rollback refused: current HEAD could not be determined."
+    head_hash = current.stdout.strip()
+    is_agent_commit = head_hash in _AGENT_COMMIT_HASHES or head_hash[:7] in _AGENT_COMMIT_HASHES
+    if not is_agent_commit:
+        author_check = _run_git(["log", "-1", "--format=%an", "HEAD"])
+        author = author_check.stdout.strip() if author_check.returncode == 0 else ""
+        if author != "Qazterion Agent":
+            return "Rollback refused: latest commit was not created by Qazterion Agent."
+
+    anc = _run_git(["merge-base", "--is-ancestor", "HEAD~1", "HEAD"])
+    if anc.returncode != 0:
+        return "Rollback refused: target commit is not a valid ancestor of current HEAD."
 
     reset = _run_git(["reset", "--hard", "HEAD~1"])
     if reset.returncode != 0:
@@ -623,7 +784,7 @@ TOOL_SCHEMAS = [
 ]
 
 configure_security_gateway(
-    workspace_getter=lambda: WORKSPACE,
+    workspace_getter=_current_workspace,
     handlers={
         "list_files": _impl_list_files,
         "read_file": _impl_read_file,

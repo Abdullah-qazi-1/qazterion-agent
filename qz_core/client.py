@@ -60,9 +60,13 @@ class FallbackCompletions:
         self._raw_client = raw_client
 
     def create(self, **kwargs):
+        call_kwargs = dict(kwargs)
+        if "messages" in call_kwargs:
+            call_kwargs["messages"] = sanitize_messages_for_llm(call_kwargs["messages"])
+
         # 1. Try local LiteLLM proxy if running
         try:
-            return self._raw_client.chat.completions.create(**kwargs)
+            return self._raw_client.chat.completions.create(**call_kwargs)
         except Exception as proxy_err:
             err_name = type(proxy_err).__name__.lower()
             err_str = (str(proxy_err) + " " + err_name).lower()
@@ -70,73 +74,70 @@ class FallbackCompletions:
             if "connection" not in err_str and "refused" not in err_str and "connect" not in err_str:
                 raise
 
-        # 2. Direct fallback to LiteLLM with active keystore provider rotation
+        # 2. Direct fallback transport to LiteLLM for the *requested* model/alias only
         try:
             import litellm
             litellm.suppress_debug_info = True
 
-            # Load any available keys from keystore
-            configured_keys = {}
-            try:
-                from qz_keystore import KeyStore
-                ks = KeyStore()
-                for k, v in ks.enabled_env().items():
-                    os.environ[k] = v
-                for entry in ks.list_entries():
-                    if entry.enabled:
-                        configured_keys.setdefault(entry.provider.lower(), []).append(ks.get_key(entry.provider, entry.index))
-            except Exception:
-                pass
+            req_model = kwargs.get("model", "gemini-3.6-flash")
+            prov_name = None
+            litellm_model = req_model
 
-            available_providers = list(configured_keys.keys())
-            if not available_providers:
-                if os.environ.get("GEMINI_KEY_1") or os.environ.get("GEMINI_API_KEY"):
-                    available_providers.append("gemini")
-
-            # Route model aliases strictly to available providers
-            model_name = kwargs.get("model", "gemini-3.6-flash")
-
-            if "gemini" in available_providers and len(available_providers) == 1:
-                # User has only Gemini configured -> route all requests to gemini-3.6-flash
-                candidates = ["gemini/gemini-3.6-flash"]
-            elif "groq" in available_providers and "gemini" not in available_providers:
-                candidates = ["groq/llama-3.3-70b-versatile", "groq/openai/gpt-oss-20b"]
+            if "/" in req_model:
+                prov_name = req_model.split("/")[0].lower()
             else:
-                candidates = ["gemini/gemini-3.6-flash", "groq/llama-3.3-70b-versatile"]
+                try:
+                    from qz_providers.model_registry import get_model_registry, DEFAULT_ALIAS_MAP
+                    model_reg = get_model_registry()
+                    meta = model_reg.get_model_by_alias(req_model)
+                    if meta:
+                        prov_name = meta.provider.lower()
+                        litellm_model = f"{meta.provider}/{meta.model_id}"
+                    elif req_model in DEFAULT_ALIAS_MAP:
+                        p, m = DEFAULT_ALIAS_MAP[req_model]
+                        prov_name = p.lower()
+                        litellm_model = f"{p}/{m}"
+                except Exception:
+                    pass
+
+            if not prov_name:
+                prov_name = "gemini" if "gemini" in req_model else ("groq" if "groq" in req_model else "mistral")
+
+            # Resolve API key from kwargs if provided, else keystore
+            api_key = kwargs.get("api_key")
+            if not api_key:
+                try:
+                    from qz_keystore import KeyStore
+                    ks = KeyStore()
+                    for entry in ks.list_entries(provider=prov_name):
+                        if entry.enabled:
+                            key_val = ks.get_key(entry.provider, entry.index)
+                            if key_val:
+                                api_key = key_val
+                                break
+                except Exception:
+                    pass
+
+            if not api_key:
+                api_key = (
+                    os.environ.get(f"{prov_name.upper()}_KEY_1")
+                    or os.environ.get(f"{prov_name.upper()}_API_KEY")
+                )
 
             # Sanitize messages for provider
             raw_messages = kwargs.get("messages", [])
             clean_messages = sanitize_messages_for_llm(raw_messages)
 
-            last_err = None
-            for model_candidate in candidates:
-                prov_name = "gemini" if "gemini" in model_candidate else ("groq" if "groq" in model_candidate else "mistral")
-                keys_list = configured_keys.get(prov_name, [os.environ.get(f"{prov_name.upper()}_KEY_1") or os.environ.get(f"{prov_name.upper()}_API_KEY")])
+            call_kwargs = dict(kwargs)
+            call_kwargs["model"] = litellm_model
+            call_kwargs["messages"] = clean_messages
+            if api_key:
+                call_kwargs["api_key"] = api_key
 
-                for api_key in keys_list:
-                    if not api_key:
-                        continue
-                    try:
-                        call_kwargs = dict(kwargs)
-                        call_kwargs["model"] = model_candidate
-                        call_kwargs["messages"] = clean_messages
-                        call_kwargs["api_key"] = api_key
-                        
-                        # Remove parameters deprecated in Gemini 3+ if present
-                        if "gemini" in model_candidate:
-                            call_kwargs.pop("top_k", None)
+            if "gemini" in litellm_model:
+                call_kwargs.pop("top_k", None)
 
-                        return litellm.completion(**call_kwargs)
-                    except Exception as attempt_err:
-                        last_err = attempt_err
-                        err_str = str(attempt_err)
-                        if "429" in err_str or "quota" in err_str.lower() or "rate" in err_str.lower():
-                            # Rate limited on this key -> continue to next key/candidate
-                            continue
-                        continue
-
-            if last_err:
-                raise last_err
+            return litellm.completion(**call_kwargs)
         except Exception as direct_err:
             raise direct_err
 

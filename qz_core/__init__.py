@@ -4,7 +4,7 @@ Modular components for classification, planning, execution, review, and git oper
 """
 
 from qz_core.client import client, PROXY_URL, MASTER_KEY, get_client
-from qz_core.common import _persist_task
+from qz_core.common import _persist_task, TaskContext
 from qz_core.classifier import (
     COMPLEXITY_MODEL_MAP,
     FORCED_TASK_MODE,
@@ -142,5 +142,6 @@ __all__ = [
     "IntegrityResult",
     "IntegrityStatus",
     "ResumeOutcome",
+    "TaskContext",
     "get_resume_manager",
 ]

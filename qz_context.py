@@ -256,3 +256,49 @@ class ContextBudgetManager:
             budget_limit=budget,
             truncated=truncated,
         )
+
+
+def fit_request_context(
+    messages: list[dict[str, Any]],
+    model_context_window: int = 32768,
+    max_output_tokens: int = 4096,
+    reserve_tokens: int = 1000,
+) -> list[dict[str, Any]]:
+    """Ensure entire message sequence fits comfortably within model's context window.
+    
+    Preserves system prompt (turn 0) and final task instructions, compacting intermediate
+    tool outputs or older message turns if the total size exceeds the budget.
+    """
+    import json
+    if not messages:
+        return []
+
+    max_input_tokens = max(2048, model_context_window - max_output_tokens - reserve_tokens)
+    total_tokens = sum(estimate_tokens(json.dumps(m, default=str)) for m in messages)
+    if total_tokens <= max_input_tokens:
+        return messages
+
+    # Compaction pass 1: Truncate oversized intermediate tool outputs
+    compacted = [dict(m) for m in messages]
+    for idx in range(1, len(compacted) - 1):
+        msg = compacted[idx]
+        if msg.get("role") == "tool" and "content" in msg:
+            content_str = str(msg["content"])
+            if len(content_str) > 2000:
+                msg["content"] = content_str[:1500] + "\n... [TRUNCATED DUE TO CONTEXT BUDGET] ..."
+
+    total_tokens = sum(estimate_tokens(json.dumps(m, default=str)) for m in compacted)
+    if total_tokens <= max_input_tokens:
+        return compacted
+
+    # Compaction pass 2: Keep system prompt (0) and last 6 turns, summarising middle
+    if len(compacted) > 8:
+        system_turn = compacted[0]
+        recent_turns = compacted[-6:]
+        summarized_middle = {
+            "role": "user",
+            "content": f"[System: Earlier {len(compacted) - 7} message turns compacted to stay within context budget.]",
+        }
+        return [system_turn, summarized_middle] + recent_turns
+
+    return compacted

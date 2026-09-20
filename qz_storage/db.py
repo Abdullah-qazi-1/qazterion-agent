@@ -250,7 +250,7 @@ class StorageManager:
             
             return {
                 "total_calls": total_calls,
-                "success_rate": (success_calls / total_calls * 100) if total_calls > 0 else 100.0,
+                "success_rate": (success_calls / total_calls * 100) if total_calls > 0 else 0.0,
                 "total_tokens": token_stats["total_tokens"] or 0,
                 "avg_latency_ms": round(token_stats["avg_latency"] or 0.0, 1),
                 "by_provider": {r["provider"]: {"calls": r["count"], "tokens": r["tokens"] or 0, "avg_latency": round(r["avg_latency"] or 0.0, 1)} for r in by_provider_rows},
