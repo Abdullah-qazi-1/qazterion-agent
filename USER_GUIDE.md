@@ -14,23 +14,27 @@
 
 Run `qazterion` to enter the interactive REPL. The following slash commands are available at any time:
 
-### `/keys` | `/model` — API Key & Model Management
-- **List Keys**: `/keys list` (shows configured providers, masked secrets, and encryption backend)
-- **Add Key**: `/keys add <provider> [index] [key]`
-  - Example: `/keys add gemini 1 AIzaSy...`
-  - Example (Multiple Keys): `/keys add gemini 2 AIzaSySecondKey...`
-- **Delete Key**: `/keys delete <provider> [index]`
-- **Test Connectivity**: `/keys test <provider> [index]`
+### `/keys` — API keys / accounts
+- **List**: `/keys list` — keystore and `.env` keys per provider (masked), with their source.
+- **Add**: `/keys add <provider> [index]` — the key is typed at a hidden prompt. Run it again to add another account (`GEMINI_KEY_2`, …).
+- **Delete / enable / disable**: `/keys delete|enable|disable <provider> <index>`
+- **Test**: `/keys test [provider] [index]` — validates keys by listing models (no tokens used).
+- **Reset**: `/keys reset` — clears all cooldowns and "rejected key" marks.
 
-### `/status` — Router Matrix & Health
-- Displays the live provider status table, discovered models, DPAPI encryption details, token counters, and latency telemetry.
+### `/model` — Roles and models
+- `/model` shows each role (`coder`, `planner`, `fast`, `reasoner`, `classify`) and which models can serve it right now.
+- `/model <role> <provider/model>` moves a model to the front of a role (saved in your `providers.yaml`).
+- `/model strategy balanced|priority` — spread load across keys, or prefer the first healthy key.
+
+### `/status` — Providers, keys and usage
+- Every key with its state (ready, cooling down for a model, rejected), the role table, and recent usage/failover counts.
 
 ### `/diff` | `/files` — Code Diff Inspector
 - Shows colored git diff of all modifications made during the active session (`+` green additions, `-` red deletions).
 
 ### `/rollback` | `/undo` — Checkpoint Restoration
-- Lists recent git checkpoints created by Qazterion.
-- Rollback: `/rollback <checkpoint_id>` reverts the workspace safely to that exact state.
+- Lists recent Qazterion checkpoints for this workspace.
+- `/rollback <checkpoint_id>` undoes that step and every later Qazterion commit. It refuses if you have uncommitted changes to tracked files or if one of your own commits would be lost.
 
 ### `/history` — Task History & Metrics
 - Displays previous autonomous tasks, status (COMPLETED/FAILED), duration, and total token usage.
@@ -181,9 +185,8 @@ pytest
 
 While all confirmed architectural and security defects have been remediated and verified, production deployments should account for the following operational characteristics:
 
-1. **Docker Daemon Availability (1 Skipped Test)**
-   - `test_docker_sandbox_isolated_execution` is skipped when Docker Desktop or the local Docker daemon is not active.
-   - *Impact*: In non-containerized environments, Qazterion falls back to the host sandbox with `sanitize_subprocess_env` and workspace boundary enforcement.
+1. **Docker is not used**
+   - Since 2.3.0 commands always run on the host with a scrubbed environment, timeouts and risk-based approval; Docker is neither required nor used.
 
 2. **Physical API Key Exhaustion at High Concurrency**
    - If all configured API keys for a provider family hit concurrent rate limits simultaneously, failover cascades across secondary configured providers.

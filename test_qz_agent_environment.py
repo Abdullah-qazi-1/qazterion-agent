@@ -30,7 +30,7 @@ def _fake_env(**overrides):
 
 class PrepareEnvironmentTests(unittest.TestCase):
     def setUp(self):
-        qz_agent._ENVIRONMENT_PREPARED = False
+        qz_agent._PREPARED_WORKSPACES.clear()
 
     def test_declines_without_approval_and_never_installs(self):
         env = _fake_env()

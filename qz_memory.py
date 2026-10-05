@@ -2,29 +2,16 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
 
 
 def _memory_path(workspace: str | Path) -> Path:
-    root = Path(workspace).resolve()
-    # A project-local store is portable with the project, while a user-level
-    # fallback keeps read-only workspaces usable.
-    local = root / ".qazterion" / "project-memory.jsonl"
-    try:
-        local.parent.mkdir(parents=True, exist_ok=True)
-        return local
-    except OSError:
-        import hashlib
-        base = Path(os.environ.get("QAZTERION_DATA_DIR", Path.home() / ".qazterion")) / "memory"
-        try:
-            base.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            pass
-        ws_hash = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:12]
-        return base / f"project-memory-{ws_hash}.jsonl"
+    """Project memory is stored per workspace in the user data dir, outside the repo."""
+    from qz_paths import workspace_state_dir
+
+    return workspace_state_dir(workspace) / "project-memory.jsonl"
 
 
 class ProjectMemory:

@@ -1,128 +1,131 @@
-"""Keys management slash command (/keys)."""
+"""/keys: manage API keys/accounts for any configured provider."""
 from __future__ import annotations
 
 import getpass
-from typing import List
+
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
-from qz_keystore import KeyStore, SUPPORTED_PROVIDERS, mask_key
-from qz_providers.connectivity import test_provider_connectivity
+
+from qz_keystore import KeyStore, UnsupportedProviderError
+
+USAGE = (
+    "Usage: /keys [list | add <provider> [index] | delete <provider> <index> | "
+    "enable|disable <provider> <index> | test <provider> [index] | reset]"
+)
 
 
-def handle_keys_command(console: Console, args: List[str]) -> None:
+def _gateway():
+    from qz_providers.gateway import get_gateway
+
+    return get_gateway()
+
+
+def _parse_index(args: list[str], position: int) -> int | None:
+    if len(args) > position:
+        try:
+            return int(args[position])
+        except ValueError:
+            return None
+    return None
+
+
+def handle_keys_command(console: Console, args: list[str]) -> None:
     ks = KeyStore()
-    subcmd = args[0].lower() if args else "list"
+    gateway = _gateway()
+    sub = args[0].lower() if args else "list"
 
-    if subcmd in ("list", "ls", "show"):
-        entries = ks.list_entries()
-        table = Table(title="[bold cyan]Configured Provider API Keys[/bold cyan]", border_style="cyan")
-        table.add_column("Provider", style="bold white")
-        table.add_column("Env Name", style="dim cyan")
-        table.add_column("Masked Secret", style="yellow")
-        table.add_column("Enabled", style="bold green")
-
-        if not entries:
-            console.print("[yellow]No API keys currently configured in keystore.[/yellow]")
-            console.print("Use [bold cyan]/keys add <provider>[/bold cyan] to register an API key.\n")
+    if sub in ("list", "ls", "show"):
+        table = Table(title="[bold cyan]API Keys[/bold cyan]", border_style="cyan")
+        for column in ("Provider", "Key", "Masked", "Source", "Enabled"):
+            table.add_column(column)
+        keys = gateway.keys.all_keys()
+        for key in sorted(keys, key=lambda k: (k.provider, k.index)):
+            table.add_row(key.provider, key.key_id, key.masked, key.source, "yes" if key.enabled else "no")
+        if not keys:
+            console.print("[yellow]No API keys configured.[/yellow] Add one with [bold cyan]/keys add <provider>[/bold cyan] "
+                          f"(providers: {', '.join(gateway.catalog.providers)}).\n")
             return
-
-        for e in entries:
-            table.add_row(
-                e.provider.upper(),
-                e.env_name,
-                e.masked_value,
-                "✔ Yes" if e.enabled else "✖ No",
-            )
         console.print(table)
-        console.print(f"[dim]Keystore encryption: {ks.backend_name().upper()} ({ks.path})[/dim]\n")
+        console.print(f"[dim]Keystore: {ks.backend_name()} ({escape(str(ks.path))}). Keys from .env/environment are read-only here.[/dim]\n")
+        return
 
-    elif subcmd in ("add", "set"):
-        prov = args[1].lower() if len(args) > 1 else ""
-        if not prov:
-            console.print("[bold cyan]Supported providers:[/bold cyan] " + ", ".join(SUPPORTED_PROVIDERS))
-            prov = input("Enter provider name (e.g. gemini, groq, mistral, openrouter): ").strip().lower()
-
-        if not prov:
+    if sub in ("add", "set"):
+        provider = (args[1] if len(args) > 1 else input(f"Provider ({', '.join(gateway.catalog.providers)}): ")).strip().lower()
+        if not provider:
             console.print("[red]Provider cannot be empty.[/red]")
             return
-
-        # Determine index
-        target_index = None
-        key_val = ""
-
-        # Check if 2nd arg is an integer index (e.g. /keys add gemini 2 <key>)
-        if len(args) > 2:
-            try:
-                target_index = int(args[2])
-                if len(args) > 3:
-                    key_val = args[3]
-            except ValueError:
-                # 2nd arg is the key itself
-                key_val = args[2]
-
-        # Auto-detect next available index if not explicitly provided
-        existing_entries = ks.list_entries(provider=prov)
-        existing_indices = {e.index for e in existing_entries}
-        if target_index is None:
-            target_index = 1
-            while target_index in existing_indices:
-                target_index += 1
-
-        if not key_val:
-            key_val = getpass.getpass(f"Enter API key for {prov.upper()} (Key #{target_index}): ").strip()
-
-        if not key_val:
-            console.print("[red]Key value cannot be empty.[/red]")
+        if len(args) > 3 or (len(args) > 2 and _parse_index(args, 2) is None):
+            # Never accept secrets on the command line: they end up in shell/REPL history.
+            console.print("[red]For safety, enter the key at the hidden prompt instead of on the command line.[/red]")
             return
-
+        index = _parse_index(args, 2)
         try:
-            env_name = ks.set_key(prov, target_index, key_val, enabled=True)
-            console.print(f"[bold green]✔ Successfully stored {prov.upper()} Key #{target_index} ({env_name}) in OS DPAPI keystore.[/bold green]\n")
-        except Exception as e:
-            console.print(f"[bold red]✖ Failed to store key:[/bold red] {e}\n")
-
-    elif subcmd in ("delete", "remove", "rm"):
-        prov = args[1].lower() if len(args) > 1 else ""
-        if not prov:
-            prov = input("Enter provider name to delete: ").strip().lower()
-        if not prov:
-            return
-
-        target_index = 1
-        if len(args) > 2:
-            try:
-                target_index = int(args[2])
-            except ValueError:
-                pass
-
-        removed = ks.delete_key(prov, target_index)
-        if removed:
-            console.print(f"[bold green]✔ Removed {prov.upper()}_{target_index} key from keystore.[/bold green]\n")
-        else:
-            console.print(f"[yellow]No stored key found for {prov.upper()} index {target_index}.[/yellow]\n")
-
-    elif subcmd in ("test", "ping"):
-        prov = args[1].lower() if len(args) > 1 else "gemini"
-        target_index = 1
-        if len(args) > 2:
-            try:
-                target_index = int(args[2])
-            except ValueError:
-                pass
-
-        console.print(f"[cyan]Testing connectivity for {prov.upper()} (Key #{target_index})...[/cyan]")
-        try:
-            key_val = ks.get_key(prov, target_index)
-            if not key_val:
-                console.print(f"[red]No API key found for {prov.upper()} index {target_index} in keystore.[/red]")
+            if index is None:
+                used = {e.index for e in ks.list_entries(provider=provider)}
+                index = 1
+                while index in used:
+                    index += 1
+            value = getpass.getpass(f"API key for {provider} (#{index}, input hidden): ").strip()
+            if not value:
+                console.print("[red]Key value cannot be empty.[/red]")
                 return
-            res = test_provider_connectivity(prov, key_val)
-            if res.connected:
-                console.print(f"[bold green]✔ Connected to {prov.upper()} Key #{target_index} successfully![/bold green] (Latency: {res.latency_ms:.0f}ms, Models: {res.models_found})\n")
-            else:
-                console.print(f"[bold red]✖ Connection failed for {prov.upper()}:[/bold red] {res.error_message}\n")
-        except Exception as e:
-            console.print(f"[bold red]✖ Connectivity test error:[/bold red] {e}\n")
+            env_name = ks.set_key(provider, index, value, enabled=True)
+        except (UnsupportedProviderError, ValueError) as error:
+            console.print(f"[red]{escape(str(error))}[/red]\n")
+            return
+        gateway.keys.invalidate()
+        gateway.health.reset_key(env_name)
+        console.print(f"[bold green]✔ Stored {env_name} for {provider} ({ks.backend_name()} encrypted).[/bold green]")
+        console.print(f"[dim]Check it with /keys test {provider} {index}[/dim]\n")
+        return
 
-    else:
-        console.print("[yellow]Usage: /keys [list | add <provider> [index] [key] | delete <provider> [index] | test <provider> [index]][/yellow]\n")
+    if sub in ("delete", "remove", "rm", "enable", "disable"):
+        provider = args[1].lower() if len(args) > 1 else ""
+        index = _parse_index(args, 2)
+        if not provider or index is None:
+            console.print(f"[yellow]{USAGE}[/yellow]\n")
+            return
+        try:
+            if sub in ("delete", "remove", "rm"):
+                ok = ks.delete_key(provider, index)
+                message = "Removed" if ok else "No stored key for"
+            else:
+                ks.set_enabled(provider, index, sub == "enable")
+                message = "Enabled" if sub == "enable" else "Disabled"
+                if sub == "enable":
+                    gateway.health.reset_key(f"{ks._family_for(provider)}_{index}")
+        except (UnsupportedProviderError, KeyError, ValueError) as error:
+            console.print(f"[red]{escape(str(error))}[/red]\n")
+            return
+        gateway.keys.invalidate()
+        console.print(f"[green]{message} {provider} key #{index}.[/green]\n")
+        return
+
+    if sub in ("test", "ping"):
+        from qz_providers.connectivity import test_provider_connectivity
+
+        provider = args[1].lower() if len(args) > 1 else ""
+        candidates = gateway.keys.keys_for(provider, include_disabled=True) if provider else gateway.keys.all_keys()
+        index = _parse_index(args, 2)
+        if index is not None:
+            candidates = [k for k in candidates if k.index == index]
+        if not candidates:
+            console.print("[red]No matching key found.[/red]\n")
+            return
+        for key in candidates:
+            result = test_provider_connectivity(key.provider, gateway.keys.secret(key.key_id) or "", catalog=gateway.catalog)
+            if result.connected:
+                gateway.health.reset_key(key.key_id)
+                console.print(f"[green]✔ {key.key_id}: {escape(result.message)} ({result.latency_ms:.0f} ms)[/green]")
+            else:
+                console.print(f"[red]✖ {key.key_id}: {escape(result.message)}[/red]")
+        console.print()
+        return
+
+    if sub == "reset":
+        gateway.health.reset_all()
+        console.print("[green]Cleared all key/model cooldowns and rejections.[/green]\n")
+        return
+
+    console.print(f"[yellow]{USAGE}[/yellow]\n")

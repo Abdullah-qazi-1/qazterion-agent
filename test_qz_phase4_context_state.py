@@ -1,8 +1,8 @@
 """Unit tests for Phase 4:
 - Hard budget pre-admission enforcement
 - Complete request context fitting and compaction
-- Fallback project memory workspace hash partitioning
-- Preferred model alias disk persistence
+- Project memory partitioned per workspace (outside the repo)
+- Preferred model per role persisted in the user catalog
 """
 import os
 import tempfile
@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 from qz_context import fit_request_context
 from qz_core.executor import request_completion
 from qz_memory import ProjectMemory, _memory_path
-from qz_providers.model_registry import ModelRegistry
+from qz_providers.catalog import ProviderCatalog
 from qz_usage_tracker import UsageTracker
 
 
@@ -67,27 +67,24 @@ class Phase4ContextAndStateTests(unittest.TestCase):
         self.assertEqual(fitted[0]["content"], "You are a coding agent.")
         self.assertEqual(fitted[-1]["content"], "Proceed with the fix")
 
-    def test_project_memory_fallback_partitions_workspaces(self):
-        # Force fallback by patching Path.mkdir to simulate uncreatable project-local .qazterion dir
-        with patch("pathlib.Path.mkdir", side_effect=OSError("Read only filesystem")):
-            path_a = _memory_path("D:/project_alpha")
-            path_b = _memory_path("D:/project_beta")
-            # Both fallback paths should be distinct SHA-256 hashed filenames
-            self.assertNotEqual(str(path_a), str(path_b))
-            self.assertIn("project-memory-", str(path_a))
-            self.assertIn("project-memory-", str(path_b))
+    def test_project_memory_partitions_workspaces(self):
+        path_a = _memory_path("D:/project_alpha")
+        path_b = _memory_path("D:/project_beta")
+        self.assertNotEqual(path_a, path_b)
+        self.assertEqual(path_a.name, "project-memory.jsonl")
+        self.assertNotIn("project_alpha", str(path_a))
 
-    def test_preferred_model_alias_persistence(self):
+    def test_preferred_model_persists_across_restarts(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch.dict(os.environ, {"QAZTERION_DATA_DIR": tmpdir}):
-                reg1 = ModelRegistry()
-                reg1.register_alias("fast-coder", "groq", "custom-model-id-v1", persist=True)
-                
-                # Recreate registry (simulating process restart)
-                reg2 = ModelRegistry()
-                # Alias mapping should be preserved
-                self.assertIn("fast-coder", reg2._aliases)
-                self.assertEqual(reg2._aliases["fast-coder"], ("groq", "custom-model-id-v1"))
+            user_file = Path(tmpdir) / "providers.yaml"
+            first = ProviderCatalog(user_path=user_file)
+            first.set_role_preference("coder", "groq", "custom-model-id-v1")
+            # A new catalog instance (process restart) sees the preference.
+            second = ProviderCatalog(user_path=user_file)
+            self.assertEqual(second.roles["coder"][0], "groq/custom-model-id-v1")
+            self.assertIn("custom-model-id-v1", second.providers["groq"].models)
+            # Legacy alias names resolve to roles.
+            self.assertEqual(second.resolve_role("coder-strong"), "coder")
 
 
 if __name__ == "__main__":

@@ -1,154 +1,162 @@
-"""Status, Diff, Rollback, History, and Rules slash commands."""
+"""/status, /model, /diff, /rollback, /history and /rules slash commands."""
 from __future__ import annotations
 
 import subprocess
+
+from qz_sandbox.backend import NO_WINDOW
 from pathlib import Path
-from typing import List
+
 from rich.console import Console
+from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
-from rich.markdown import Markdown
 
-from qz_keystore import KeyStore
-from qz_storage import get_storage
-from qz_cli.formatters import render_status_table, render_diff
+from qz_cli.formatters import render_diff, render_roles_table, render_status_table
 from qz_security.rules_loader import load_project_rules
 
 
+def _gateway():
+    from qz_providers.gateway import get_gateway
+
+    return get_gateway()
+
+
 def handle_status_command(console: Console, workspace: Path) -> None:
-    ks = KeyStore()
-    entries = ks.list_entries()
-    storage = get_storage()
-    metrics = storage.get_metrics_summary()
+    from qz_keystore import KeyStore
+    from qz_usage_tracker import get_usage_tracker
 
-    configured_providers = {e.provider.lower(): e for e in entries}
-    all_providers = [
-        {"provider_id": "gemini", "display_name": "Google Gemini", "models": ["gemini-3.6-flash", "gemini-3.6-pro"], "configured": "gemini" in configured_providers},
-        {"provider_id": "groq", "display_name": "Groq LPU Accelerator", "models": ["llama-3.3-70b-versatile"], "configured": "groq" in configured_providers},
-        {"provider_id": "mistral", "display_name": "Mistral AI", "models": ["codestral-latest", "mistral-large"], "configured": "mistral" in configured_providers},
-        {"provider_id": "openrouter", "display_name": "OpenRouter Mesh", "models": ["anthropic/claude-3.5-sonnet", "deepseek-r1"], "configured": "openrouter" in configured_providers},
-        {"provider_id": "deepseek", "display_name": "DeepSeek AI", "models": ["deepseek-chat", "deepseek-reasoner"], "configured": "deepseek" in configured_providers},
-    ]
+    status = _gateway().status()
+    render_status_table(console, status["providers"], KeyStore().backend_name())
+    render_roles_table(console, status["roles"])
+    console.print(f"[dim]Key strategy: {status['key_strategy']}  •  transport: direct (no proxy)[/dim]")
 
-    render_status_table(console, all_providers, ks.backend_name())
+    usage = get_usage_tracker().summary()
+    pool = usage["global_pool"]
+    text = Text()
+    text.append(f"• Requests (recent): {usage['request_count']}  ", style="bold white")
+    text.append(f"success {pool['success_rate']:.1f}%\n", style="green" if pool["success_rate"] >= 80 else "red")
+    text.append(f"• Tokens: {usage['total_tokens']:,}   failovers: {usage['fallback_count']}\n", style="cyan")
+    text.append(f"• Average latency: {pool['latency_ms']:.0f} ms\n", style="yellow")
+    if usage.get("last_error"):
+        text.append(f"• Last error: {escape(str(usage['last_error'])[:150])}\n", style="dim red")
+    console.print(Panel(text, title="[bold cyan]Usage[/bold cyan]", border_style="cyan"))
 
-    # Print usage summary panel
-    usage_text = Text()
-    usage_text.append(f"• Total Model Invocations: {metrics['total_calls']}\n", style="bold white")
-    usage_text.append(f"• Overall Success Rate: {metrics['success_rate']:.1f}%\n", style="green" if metrics['success_rate'] >= 80 else "red")
-    usage_text.append(f"• Total Tokens Processed: {metrics['total_tokens']:,}\n", style="cyan")
-    usage_text.append(f"• Average Model Latency: {metrics['avg_latency_ms']:.0f}ms\n", style="yellow")
-    usage_text.append(f"• Storage Database: {storage.db_path}\n", style="dim white")
 
-    console.print(Panel(usage_text, title="[bold cyan]Telemetry & Health Metrics[/bold cyan]", border_style="cyan"))
+def handle_model_command(console: Console, args: list[str]) -> None:
+    """/model                      show roles
+    /model <role> <provider/model>  put a model first for a role
+    /model strategy balanced|priority"""
+    from qz_providers.catalog import CatalogError, parse_model_ref
+
+    gateway = _gateway()
+    if not args:
+        render_roles_table(console, gateway.status()["roles"])
+        console.print("[dim]Use /model <role> <provider/model> to prefer a model, or /model strategy balanced|priority.[/dim]\n")
+        return
+    try:
+        if args[0].lower() == "strategy" and len(args) > 1:
+            console.print(f"[green]Key strategy set to {gateway.catalog.set_key_strategy(args[1])}.[/green]\n")
+            return
+        if len(args) < 2:
+            raise CatalogError("Usage: /model <role> <provider/model>")
+        provider, model = parse_model_ref(args[1])
+        gateway.catalog.set_role_preference(args[0], provider, model)
+        role = gateway.catalog.resolve_role(args[0]) or args[0]
+        console.print(f"[green]Role '{role}' now prefers {provider}/{model}.[/green]\n")
+    except CatalogError as error:
+        console.print(f"[red]{escape(str(error))}[/red]\n")
+
+
+def _git(workspace: Path, *args: str, timeout: float = 5.0) -> subprocess.CompletedProcess:
+    from qz_sandbox.backend import sanitize_subprocess_env
+
+    return subprocess.run(
+        ["git", *args], cwd=str(workspace), capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=timeout, env=sanitize_subprocess_env(str(workspace)),
+        stdin=subprocess.DEVNULL,
+        creationflags=NO_WINDOW,
+    )
 
 
 def handle_diff_command(console: Console, workspace: Path) -> None:
     try:
-        from qz_sandbox.backend import sanitize_subprocess_env
-        clean_env = sanitize_subprocess_env(str(workspace))
-        res = subprocess.run(
-            ["git", "diff", "HEAD"],
-            cwd=str(workspace),
-            capture_output=True,
-            text=True,
-            timeout=5.0,
-            env=clean_env,
-        )
-        diff_out = res.stdout
-        if not diff_out.strip():
-            # Check untracked files
-            status_res = subprocess.run(
-                ["git", "status", "--short"],
-                cwd=str(workspace),
-                capture_output=True,
-                text=True,
-                timeout=3.0,
-                env=clean_env,
-            )
-            if status_res.stdout.strip():
-                console.print(Panel(status_res.stdout, title="[bold yellow]Git Status (Untracked Files)[/bold yellow]", border_style="yellow"))
-            else:
-                console.print("[green]✔ Working tree clean — no uncommitted changes.[/green]\n")
+        diff_out = _git(workspace, "diff", "HEAD").stdout
+        if diff_out.strip():
+            render_diff(console, "Working Tree vs HEAD", diff_out)
             return
-
-        render_diff(console, "Working Tree vs HEAD", diff_out)
+        status = _git(workspace, "status", "--short").stdout
+        if status.strip():
+            console.print(Panel(escape(status), title="[bold yellow]Git Status (Untracked Files)[/bold yellow]", border_style="yellow"))
+        else:
+            console.print("[green]✔ Working tree clean — no uncommitted changes.[/green]\n")
     except Exception as e:
-        console.print(f"[red]Failed to get git diff:[/red] {e}\n")
+        console.print(f"[red]Failed to get git diff:[/red] {escape(str(e))}\n")
 
 
-def handle_rollback_command(console: Console, workspace: Path, args: List[str]) -> None:
+def handle_rollback_command(console: Console, workspace: Path, args: list[str]) -> None:
+    """/rollback            list this workspace's checkpoints
+    /rollback <id>       undo the checkpoint's step and everything after it"""
     from qz_recovery import get_resume_manager
-    mgr = get_resume_manager(str(workspace))
-    storage = get_storage()
-    checkpoints = storage.list_checkpoints(limit=10)
+    from qz_tasks.task_manager import get_checkpoint, list_checkpoints
 
-    if not checkpoints:
-        console.print("[yellow]No recent checkpoints recorded in storage.[/yellow]\n")
+    if args:
+        try:
+            checkpoint = get_checkpoint(int(args[0]))
+        except ValueError:
+            checkpoint = None
+        if checkpoint is None:
+            console.print(f"[red]Checkpoint {escape(args[0])} not found.[/red]\n")
+            return
+        outcome = get_resume_manager(workspace).safe_rollback_to_checkpoint(
+            task_id=str(checkpoint["task_id"]), checkpoint_id=int(checkpoint["id"]), workspace=workspace,
+        )
+        style = "bold green" if outcome.success else "bold red"
+        console.print(f"[{style}]{escape(outcome.message)}[/{style}]\n")
         return
 
-    table = Table(title="[bold cyan]Recent Task Checkpoints[/bold cyan]", border_style="cyan")
-    table.add_column("ID", style="bold white")
-    table.add_column("Task ID", style="dim cyan")
-    table.add_column("Git Commit", style="yellow")
-    table.add_column("Step Name", style="bold green")
-    table.add_column("Timestamp", style="dim white")
-
+    checkpoints = list_checkpoints(workspace=str(workspace), limit=10)
+    if not checkpoints:
+        console.print("[yellow]No Qazterion checkpoints recorded for this workspace.[/yellow]\n")
+        return
+    table = Table(title="[bold cyan]Recent Checkpoints[/bold cyan]", border_style="cyan")
+    for column in ("ID", "Task", "Commit", "Step", "Time"):
+        table.add_column(column)
     for cp in checkpoints:
         table.add_row(
             str(cp["id"]),
-            str(cp["task_id"])[:8],
-            str(cp["git_hash"])[:8],
-            str(cp["step_name"]),
-            str(cp["timestamp"])[:19].replace("T", " "),
+            escape(str(cp.get("user_request") or cp["task_id"])[:40]),
+            str(cp.get("git_commit_hash") or "")[:8],
+            escape(str(cp.get("summary") or "")[:50]),
+            str(cp.get("created_at") or "")[:19].replace("T", " "),
         )
     console.print(table)
-
-    if args:
-        target_cp = args[0]
-        console.print(f"[bold yellow]Reverting workspace to checkpoint {target_cp}...[/bold yellow]")
-        try:
-            matched = next((c for c in checkpoints if str(c["id"]) == target_cp or c["git_hash"].startswith(target_cp)), None)
-            if matched:
-                outcome = mgr.safe_rollback_to_checkpoint(
-                    task_id=str(matched["task_id"]),
-                    checkpoint_id=matched["id"],
-                    workspace=workspace,
-                )
-                if outcome.success:
-                    console.print(f"[bold green]✔ Successfully reverted: {outcome.message}[/bold green]\n")
-                else:
-                    console.print(f"[bold red]✖ Rollback blocked:[/bold red] {outcome.message}\n")
-            else:
-                console.print(f"[red]Checkpoint {target_cp} not found.[/red]\n")
-        except Exception as e:
-            console.print(f"[red]Rollback failed:[/red] {e}\n")
+    console.print("[dim]/rollback <ID> undoes that step and every later Qazterion commit (your own commits and uncommitted work are never discarded).[/dim]\n")
 
 
 def handle_history_command(console: Console, workspace: Path) -> None:
-    storage = get_storage()
-    tasks = storage.list_recent_tasks(limit=10)
+    from qz_tasks.task_manager import list_recent_tasks
+    from qz_usage_tracker import get_usage_tracker
 
+    tasks = list_recent_tasks(workspace=str(workspace), limit=10)
     if not tasks:
         console.print("[yellow]No task history recorded yet.[/yellow]\n")
         return
-
-    table = Table(title="[bold cyan]Recent Autonomous Tasks[/bold cyan]", border_style="cyan")
-    table.add_column("Task ID", style="bold white")
-    table.add_column("Prompt", style="white")
-    table.add_column("Status", style="bold")
-    table.add_column("Tokens", style="yellow")
-    table.add_column("Duration", style="dim white")
-
-    for t in tasks:
-        status_color = "green" if t["status"] == "completed" else ("red" if t["status"] == "failed" else "yellow")
+    tracker = get_usage_tracker()
+    table = Table(title="[bold cyan]Recent Tasks[/bold cyan]", border_style="cyan")
+    for column in ("Task ID", "Request", "Status", "Tokens", "Started"):
+        table.add_column(column)
+    for task in tasks:
+        status = str(task.get("status") or "").upper()
+        color = "green" if status == "COMPLETED" else ("red" if status == "FAILED" else "yellow")
+        request = str(task.get("user_request") or "")
         table.add_row(
-            str(t["id"])[:8],
-            str(t["prompt"])[:45] + ("..." if len(t["prompt"]) > 45 else ""),
-            f"[{status_color}]{t['status'].upper()}[/{status_color}]",
-            f"{t.get('tokens_used', 0):,}",
-            f"{t.get('latency_ms', 0):.0f}ms",
+            str(task["id"])[:8],
+            escape(request[:45] + ("..." if len(request) > 45 else "")),
+            f"[{color}]{status}[/{color}]",
+            f"{tracker.get_task_usage(task['id'])['total_tokens']:,}",
+            str(task.get("created_at") or "")[:19].replace("T", " "),
         )
     console.print(table)
 
@@ -156,9 +164,9 @@ def handle_history_command(console: Console, workspace: Path) -> None:
 def handle_rules_command(console: Console, workspace: Path) -> None:
     rules = load_project_rules(workspace)
     rules_file = workspace / ".qazterion" / "rules.md"
-    
-    console.print(f"[bold cyan]Active Project Rules[/bold cyan] (Source: {rules_file if rules_file.exists() else 'Default Built-in'})\n")
+    source = rules_file if rules_file.exists() else "built-in defaults"
+    console.print(f"[bold cyan]Active Project Rules[/bold cyan] (source: {escape(str(source))})\n")
     if rules.raw_content:
         console.print(Panel(Markdown(rules.raw_content), title="[bold green].qazterion/rules.md[/bold green]", border_style="green"))
     else:
-        console.print("[dim]No custom .qazterion/rules.md found. Using standard autonomous safe practices.[/dim]\n")
+        console.print("[dim]No .qazterion/rules.md found. Using standard safe practices.[/dim]\n")

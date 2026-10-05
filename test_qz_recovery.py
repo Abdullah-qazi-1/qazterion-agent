@@ -164,12 +164,13 @@ class ResumeManagerTests(unittest.TestCase):
         # 2. ROLLBACK
         task_id_rollback = self.task_manager.create_task("Rollback test", str(self.tmp_dir.name))
         self.task_manager.create_checkpoint(task_id_rollback, iteration_number=1, git_commit_hash="c1")
-        with patch("qz_tools.rollback_last_change", return_value="Rollback complete: reset to c1."):
+        rolled = ResumeOutcome(success=True, action="ROLLED_BACK", message="ok")
+        with patch.object(ResumeManager, "safe_rollback_to_checkpoint", return_value=rolled) as safe:
             outcome = manager.resume_task(task_id_rollback, decision="ROLLBACK")
             self.assertTrue(outcome.success)
             self.assertEqual(outcome.action, "ROLLED_BACK")
-            task = self.task_manager.get_task(task_id_rollback)
-            self.assertEqual(task["status"], TaskStatus.CANCELLED)
+            # ROLLBACK undoes the whole task through the guarded rollback path.
+            self.assertEqual(safe.call_args.args[0], task_id_rollback)
 
         # 3. DISCARD
         task_id_discard = self.task_manager.create_task("Discard test", str(self.tmp_dir.name))
@@ -212,7 +213,6 @@ class ExecutorResumeRegressionTests(unittest.TestCase):
             patch("qz_agent.request_completion", return_value=(mock_response, "groq-fast"), create=True),
             patch("qz_agent.ValidationPipeline", return_value=mock_pipeline_instance, create=True),
             patch("qz_core.executor.classify_task_complexity", return_value="simple"),
-            patch("qz_core.executor.select_route", return_value=("groq-fast", "GROQ_KEY_1")),
             patch("qz_core.executor.request_completion", return_value=(mock_response, "groq-fast")),
             patch("qz_core.executor.ValidationPipeline", return_value=mock_pipeline_instance),
             patch("qz_core.executor._task_requires_test_changes", return_value=False),

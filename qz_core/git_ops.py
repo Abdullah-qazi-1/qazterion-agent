@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from openai import OpenAI
 from qz_core.client import get_client
-from qz_tools import commit_changes, ensure_git_repository
+from qz_sandbox.backend import NO_WINDOW
 
 
 def _commit_hash_from_result(commit_result: str) -> str | None:
@@ -17,7 +17,7 @@ def generate_commit_message(task: str, changes: list[dict], client: OpenAI | Non
     c = get_client(client)
     try:
         response = c.chat.completions.create(
-            model="groq-fast",
+            model="fast",
             messages=[
                 {
                     "role": "system",
@@ -42,10 +42,10 @@ def generate_commit_message(task: str, changes: list[dict], client: OpenAI | Non
 def get_current_head(workspace: str | None = None) -> str | None:
     """Return the current short or full git HEAD commit hash, or None if unavailable."""
     import subprocess
-    from qz_tools import WORKSPACE
+    from qz_tools import current_workspace
     from qz_sandbox.backend import sanitize_subprocess_env
     from pathlib import Path
-    ws = Path(workspace or WORKSPACE).resolve()
+    ws = Path(workspace or current_workspace()).resolve()
     try:
         res = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -55,6 +55,8 @@ def get_current_head(workspace: str | None = None) -> str | None:
             errors="replace",
             check=False,
             env=sanitize_subprocess_env(str(ws)),
+            stdin=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
         )
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
@@ -64,21 +66,27 @@ def get_current_head(workspace: str | None = None) -> str | None:
 
 
 def get_uncommitted_files(workspace: str | None = None) -> list[str]:
-    """Return list of modified, staged, or untracked files in the workspace."""
+    """Return tracked files with uncommitted (staged or unstaged) changes.
+
+    Untracked files are ignored: a hard reset never touches them, and build
+    artifacts such as __pycache__ must not block rollback or resume.
+    """
     import subprocess
-    from qz_tools import WORKSPACE
+    from qz_tools import current_workspace
     from qz_sandbox.backend import sanitize_subprocess_env
     from pathlib import Path
-    ws = Path(workspace or WORKSPACE).resolve()
+    ws = Path(workspace or current_workspace()).resolve()
     try:
         res = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "--untracked-files=no"],
             cwd=ws,
             capture_output=True,
             text=True,
             errors="replace",
             check=False,
             env=sanitize_subprocess_env(str(ws)),
+            stdin=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
         )
         if res.returncode == 0 and res.stdout.strip():
             return [line.strip() for line in res.stdout.splitlines() if line.strip()]
@@ -95,12 +103,12 @@ def is_worktree_clean(workspace: str | None = None) -> bool:
 def commit_exists(commit_hash: str, workspace: str | None = None) -> bool:
     """Return True if the specified commit exists in git repository history."""
     import subprocess
-    from qz_tools import WORKSPACE
+    from qz_tools import current_workspace
     from qz_sandbox.backend import sanitize_subprocess_env
     from pathlib import Path
     if not commit_hash:
         return False
-    ws = Path(workspace or WORKSPACE).resolve()
+    ws = Path(workspace or current_workspace()).resolve()
     try:
         res = subprocess.run(
             ["git", "cat-file", "-t", commit_hash],
@@ -110,6 +118,8 @@ def commit_exists(commit_hash: str, workspace: str | None = None) -> bool:
             errors="replace",
             check=False,
             env=sanitize_subprocess_env(str(ws)),
+            stdin=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
         )
         return res.returncode == 0 and res.stdout.strip() == "commit"
     except Exception:

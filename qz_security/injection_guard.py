@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
 
 
 # Patterns attempting to override system prompts, bypass sandboxing, or exfiltrate secrets

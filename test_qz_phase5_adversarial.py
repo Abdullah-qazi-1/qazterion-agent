@@ -1,10 +1,8 @@
 """Adversarial and integration tests for Phase 5:
 - Malicious repository Git hook cannot access credentials
 - Tool prompt injection is quarantined
-- Concurrency limiting under multi-threaded stress
 - Cross-workspace isolation
 """
-import concurrent.futures
 import os
 import subprocess
 import tempfile
@@ -13,7 +11,6 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from qz_memory import ProjectMemory, _memory_path
-from qz_pool.concurrency import ConcurrencyLimiter
 from qz_sandbox.backend import sanitize_subprocess_env
 from qz_security.injection_guard import scan_for_injection, wrap_untrusted_content
 
@@ -58,22 +55,13 @@ class Phase5AdversarialTests(unittest.TestCase):
             self.assertIn("[SECURITY NOTICE:", wrapped)
             self.assertNotIn("<|im_start|>", wrapped)
 
-    def test_concurrency_limiter_under_thread_stress(self):
-        limiter = ConcurrencyLimiter(default_max_concurrency=2)
-        max_seen = 0
-        lock = concurrent.futures.ThreadPoolExecutor(max_workers=8)
-
-        def worker():
-            nonlocal max_seen
-            with limiter.slot("KEY_TEST"):
-                cnt = limiter.get_active_count("KEY_TEST")
-                if cnt > max_seen:
-                    max_seen = cnt
-
-        futures = [lock.submit(worker) for _ in range(20)]
-        concurrent.futures.wait(futures)
-        self.assertLessEqual(max_seen, 2)
-        self.assertEqual(limiter.get_active_count("KEY_TEST"), 0)
+    def test_project_memory_is_isolated_per_workspace_and_outside_the_repo(self):
+        with tempfile.TemporaryDirectory() as a, tempfile.TemporaryDirectory() as b:
+            ProjectMemory(a).remember("completed_feature", "feature A")
+            ProjectMemory(b).remember("completed_feature", "feature B")
+            self.assertNotEqual(_memory_path(a), _memory_path(b))
+            self.assertFalse(str(_memory_path(a)).startswith(str(Path(a).resolve())))
+            self.assertFalse((Path(a) / ".qazterion").exists())
 
 
 if __name__ == "__main__":

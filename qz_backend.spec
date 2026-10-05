@@ -1,24 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all, collect_submodules
+# PyInstaller spec for the desktop backend (JSON-RPC over stdio for Electron).
+# Build: pip install -e .[build] && pyinstaller qz_backend.spec
+from PyInstaller.utils.hooks import collect_submodules
 
-datas = []
-binaries = []
 hiddenimports = []
-
-# Third-party packages that use dynamic imports / plugins
-for pkg in ('litellm', 'openai', 'cryptography'):
-    tmp_ret = collect_all(pkg)
-    datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-
-# Our own backend packages: PyInstaller's static analysis can miss modules
-# that are imported dynamically (e.g. via importlib, plugin registries), so
-# explicitly pull in every submodule of each first-party package.
+# First-party packages: include every submodule (some are imported lazily).
 for pkg in (
+    'qz_cli',
     'qz_core',
-    'qz_pool',
     'qz_providers',
     'qz_recovery',
-    'qz_router',
     'qz_sandbox',
     'qz_security',
     'qz_tasks',
@@ -26,40 +17,38 @@ for pkg in (
 ):
     hiddenimports += collect_submodules(pkg)
 
-# Top-level single-file backend modules imported dynamically or lazily
 hiddenimports += [
     'qz_agent',
-    'qz_tools',
-    'qz_desktop_backend',
     'qz_context',
+    'qz_desktop_backend',
     'qz_environment',
     'qz_health',
     'qz_indexer',
     'qz_keystore',
     'qz_memory',
-    'qz_proxy_manager',
+    'qz_paths',
     'qz_repair',
-    'qz_telemetry',
     'qz_task_compiler',
+    'qz_tools',
     'qz_usage_tracker',
-    'generate_config',
 ]
 
-# Non-python files the backend reads at runtime
-datas += [
-    ('config.yaml', '.'),
+# Non-Python files read at runtime.
+datas = [
+    ('qz_providers/default_providers.yaml', 'qz_providers'),
 ]
 
 a = Analysis(
     ['qz_desktop_bridge.py'],
     pathex=[],
-    binaries=binaries,
+    binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Heavy optional packages that are never needed by the backend.
+    excludes=['tkinter', 'sentence_transformers', 'torch', 'numpy', 'litellm'],
     noarchive=False,
     optimize=0,
 )
@@ -78,11 +67,8 @@ exe = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    # The backend is a long-lived JSON-RPC stdio server.  A windowed
-    # executable can lose usable stdin/stdout handles on Windows, making a
-    # healthy bundled backend appear unavailable. Electron launches this with
-    # windowsHide=True, so the console subsystem keeps reliable pipes without
-    # showing a console window to installed-app users.
+    # Long-lived JSON-RPC stdio server: the console subsystem keeps reliable
+    # stdin/stdout pipes; Electron launches it with windowsHide=True.
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,

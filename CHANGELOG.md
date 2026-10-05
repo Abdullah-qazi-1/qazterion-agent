@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [2.3.0] — 2026-10-05 (Multi-provider gateway, safety and reliability overhaul)
+
+### Architecture
+* **In-process provider gateway** (`qz_providers`): roles → provider/model/key selection, key rotation, per-(key, model) rate-limit/quota cooldowns, invalid-key disabling, retired-model benching, cross-provider failover, bounded attempts and short waits for cooldowns. Health is persisted and shared between processes.
+* **One provider catalog** (`default_providers.yaml` + user `providers.yaml`) replaces `config.yaml`, the alias map, router fallbacks, executor fallbacks and the scoring table. Adding a provider is configuration only.
+* **LiteLLM proxy removed** (no background process, no port 4000, no master key); `litellm` is no longer a dependency. Removed `qz_pool`, `qz_router`, `qz_storage`, `qz_telemetry`, `qz_proxy_manager`, `generate_config`, the Docker sandbox and `setup.py`.
+* One task database (`qz_tasks`) in the user data dir; index cache and project memory moved out of the project.
+
+### Fixed
+* The CLI authenticated with a hard-coded proxy key and model calls with stored keys crashed (`api_key` passed to the SDK).
+* Desktop bridge could lose all RPC replies under concurrent requests (`redirect_stdout` race); decrypted keys were exposed over RPC.
+* Destructive git commands ran without approval; repair rollback could wipe user edits; checkpoint rollback could fall back to `HEAD~1` or discard user commits; `force` skipped safety checks.
+* Non-ASCII files were corrupted and CRLF files rewritten as LF on Windows; zero-length diff hunks inserted at the wrong line.
+* Permission prompts crashed in the CLI and treated "deny" as approval; plan approval never happened in the CLI and edited plans were ignored by the desktop app; EOF auto-approved plans.
+* Tasks in repositories with pre-existing failing tests could never complete; validation commands could run in the wrong directory.
+* Tool exceptions aborted whole tasks; cancellation still validated and committed; checkpoint ordering, missing `get_checkpoint`, Rich markup in help, `formatters` missing `import sys`.
+* Dashboard usage never refreshed; proxy status fields were missing; `pip install requests` was blocked while `git reset --hard` was allowed.
+
+### Tests
+* Hermetic suite (temp data dir, no `.env`, offline gateway). New tests for the catalog, keys, error classification, health, gateway failover/rotation, adapters over a real local HTTP server, file safety, rollback safety against real git, DAG resilience, the bridge protocol and a full end-to-end task through the real pipeline.
+
+---
+
 ## [2.2.0] — 2026-09-18 (Part 2 Independent Audit Remediation & Hardening)
 
 ### Security & Instruction Hierarchy

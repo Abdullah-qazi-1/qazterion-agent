@@ -5,19 +5,12 @@ import pytest
 from pathlib import Path
 
 from qz_keystore import KeyStore, mask_key, register_provider_family
-from qz_pool import LLMPool, reset_pool
-from qz_pool.models import APIKey
+from qz_providers.health import HealthTracker
 from qz_security.redaction import redact
 from qz_security.secret_scanner import scan
 
 
 class TestSecureKeyManagement:
-    def setup_method(self, tmp_path=None):
-        reset_pool()
-
-    def teardown_method(self):
-        reset_pool()
-
     def test_mask_key_never_reveals_plaintext(self):
         assert mask_key("gsk_1234567890abcdef123456") == "******23456"[-10:] or mask_key("gsk_1234567890abcdef123456").startswith("******")
         assert "gsk_1234567890abcdef" not in mask_key("gsk_1234567890abcdef123456")
@@ -53,23 +46,38 @@ class TestSecureKeyManagement:
             assert cohere_entries[0].env_name == "COHERE_KEY_1"
 
     def test_physical_key_isolation(self):
-        pool = LLMPool()
-        k1 = APIKey(id="GROQ_KEY_1", provider="groq", key_reference="GROQ_KEY_1", label="Key 1")
-        k2 = APIKey(id="GROQ_KEY_2", provider="groq", key_reference="GROQ_KEY_2", label="Key 2")
-        pool.registry.register_key(k1)
-        pool.registry.register_key(k2)
+        health = HealthTracker(persist=False)
+        health.record_failure("GROQ_KEY_1", "groq/m", "rate_limit", "429")
+        # Key 1 cools down; key 2 of the same provider stays fully available.
+        assert not health.key_available("GROQ_KEY_1")
+        assert health.key_available("GROQ_KEY_2")
+        assert health.key_state("GROQ_KEY_1").failures == 1
+        assert health.key_state("GROQ_KEY_2") is None or health.key_state("GROQ_KEY_2").failures == 0
 
-        # Record failure on Key 1
-        pool.health_manager.record_failure("GROQ_KEY_1", error_type="rate_limit", latency_ms=150.0)
+    def test_keystore_writes_are_atomic_and_listing_does_not_need_secrets(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            ks = KeyStore(path=Path(td) / "keystore.dat", backend="fernet")
+            ks.set_key("groq", 1, "gsk_live_secret_key_number_1")
+            # A second instance (another process) adds a key; the first must not lose it.
+            other = KeyStore(path=Path(td) / "keystore.dat", backend="fernet")
+            other.set_key("gemini", 1, "AIza_second_process_key")
+            ks.set_key("groq", 2, "gsk_live_secret_key_number_2")
+            names = sorted(e.env_name for e in KeyStore(path=Path(td) / "keystore.dat", backend="fernet").list_entries())
+            assert names == ["GEMINI_KEY_1", "GROQ_KEY_1", "GROQ_KEY_2"]
+            assert not list(Path(td).glob("*.tmp"))
+            raw = (Path(td) / "keystore.dat").read_text(encoding="utf-8")
+            assert "gsk_live_secret" not in raw and "AIza_second" not in raw
 
-        # Key 1 is in cooldown, Key 2 remains completely healthy and available
-        assert not pool.health_manager.is_available("GROQ_KEY_1")
-        assert pool.health_manager.is_available("GROQ_KEY_2")
-
-        h1 = pool.health_manager.get_health("GROQ_KEY_1")
-        h2 = pool.health_manager.get_health("GROQ_KEY_2")
-        assert h1.error_count == 1
-        assert h2.error_count == 0
+    def test_keystore_accepts_providers_defined_in_the_catalog_only(self):
+        import tempfile
+        from qz_keystore import UnsupportedProviderError
+        with tempfile.TemporaryDirectory() as td:
+            ks = KeyStore(path=Path(td) / "keystore.dat", backend="fernet")
+            with pytest.raises(UnsupportedProviderError):
+                ks.set_key("no-such-provider", 1, "x" * 20)
+            with pytest.raises(UnsupportedProviderError):
+                ks.set_key("../evil", 1, "x" * 20)
 
     def test_secret_scanner_and_redaction(self):
         raw_prompt = "Using apiKey: gsk_abcdef12345678901234567890 to call model"

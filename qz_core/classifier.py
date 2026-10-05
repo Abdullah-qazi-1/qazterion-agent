@@ -9,11 +9,12 @@ from qz_core.client import get_client
 # PHASE 2: Automatic model routing by complexity
 # ============================================================
 
-# Simple task -> inexpensive/fast model. Complex task -> more capable model.
-# Escalates to "reasoner" after three consecutive verification failures.
+# Simple task -> the "fast" role, complex task -> the "coder" role. Roles map to
+# concrete provider models in the provider catalog. The executor escalates to
+# the "reasoner" role after three consecutive verification failures.
 COMPLEXITY_MODEL_MAP = {
-    "simple": "groq-fast",
-    "complex": "coder-strong",
+    "simple": "fast",
+    "complex": "coder",
 }
 
 _COMPLEX_KEYWORDS = [
@@ -26,10 +27,9 @@ _COMPLEX_KEYWORDS = [
 
 def classify_task_complexity(task: str, client: OpenAI | None = None) -> str:
     """Classify a task as simple or complex.
-    First attempt a short, inexpensive groq-fast LLM call (it is more accurate
-    because it understands context). If the call fails (proxy down,
-    model_not_found, and so on), fall back to a keyword/length heuristic
-    so routing never crashes."""
+    First attempt a short, inexpensive "classify" call (more accurate because
+    it understands context). If no provider is reachable, fall back to a
+    keyword/length heuristic so routing never crashes."""
     c = get_client(client)
     try:
         resp = c.chat.completions.create(
@@ -61,7 +61,7 @@ def classify_task_complexity(task: str, client: OpenAI | None = None) -> str:
             return "simple"
         # Unexpected or empty response: fall back to the heuristic below.
     except Exception as e:
-        print(f"\033[90m[classify] groq-fast classification failed ({e}); using the heuristic\033[0m")
+        print(f"\033[90m[classify] classification failed ({e}); using the heuristic\033[0m")
 
     # --- Heuristic fallback ---
     task_lower = task.lower()

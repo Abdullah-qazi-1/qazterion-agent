@@ -7,9 +7,9 @@ from openai import OpenAI
 from qz_core.client import get_client
 from qz_core.common import _persist_task
 from qz_indexer import format_index_summary, load_or_build_index
-from qz_tools import WORKSPACE
+import qz_tools
 from qz_task_compiler import TaskCompiler
-from qz_tasks.models import SubtaskStatus, TaskStatus
+from qz_tasks.models import TaskStatus
 from qz_tasks.task_manager import create_subtasks, log_event, update_status
 
 PLANNER_MODEL = "planner"
@@ -32,7 +32,7 @@ def _get_workspace() -> str:
     agent_mod = sys.modules.get("qz_agent")
     if agent_mod and hasattr(agent_mod, "WORKSPACE"):
         return getattr(agent_mod, "WORKSPACE")
-    return WORKSPACE
+    return qz_tools.current_workspace()
 
 
 def call_planner(task: str, index_summary: str | None = None, client: OpenAI | None = None) -> str:
@@ -167,9 +167,10 @@ def prompt_plan_approval(plan: str, architecture: str) -> tuple[str, str, str]:
     while True:
         try:
             choice = input("Your choice [A/e/r/b]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt, Exception):
+        except (EOFError, KeyboardInterrupt, OSError):
+            # No one can answer: never treat silence as approval.
             print()
-            return "approved", plan, architecture
+            return "rejected", plan, architecture
 
         if choice in ("", "a", "approve"):
             return "approved", plan, architecture
@@ -372,8 +373,12 @@ def convert_plan_to_subtasks(
     return subtasks
 
 
-def resolve_plan(task: str, index_summary: str, approval_setting: str, mode: str, interactive_clarifications: bool = True, task_id: str | None = None) -> dict:
+def resolve_plan(task: str, index_summary: str, approval_setting: str, mode: str, interactive_clarifications: bool = True, task_id: str | None = None, build_dag: bool = True) -> dict:
     """Run the clarify -> plan -> architecture -> approval -> DAG pipeline for one task.
+
+    With ``build_dag=False`` the subtask DAG is not created; callers that run
+    their own approval step (desktop app, CLI) call :func:`finalize_plan` after
+    the user approved or edited the plan, so edits actually shape execution.
 
     Returns a dict with: status ("ready" or "rejected"), task, plan, architecture, decision, mode, subtasks.
     """
@@ -445,7 +450,19 @@ def resolve_plan(task: str, index_summary: str, approval_setting: str, mode: str
             return result
         _persist_task(task_id, lambda: log_event(task_id, "APPROVAL_RECEIVED", {"decision": decision}))
 
-    # Plan is finalized -> convert to structured DAG
-    subtasks = _convert_to_subtasks(task, plan, architecture, task_id=task_id)
-    result.update(status="ready", plan=plan, architecture=architecture, subtasks=subtasks)
+    result.update(status="ready", plan=plan, architecture=architecture, subtasks=None)
+    if build_dag:
+        result["subtasks"] = _convert_to_subtasks(task, plan, architecture, task_id=task_id)
     return result
+
+
+def finalize_plan(outcome: dict, *, task_id: str | None = None, plan: str | None = None) -> dict:
+    """Create the subtask DAG for an approved (possibly edited) plan."""
+    if outcome.get("subtasks"):
+        return outcome
+    if plan is not None and plan.strip():
+        outcome["plan"] = plan.strip()
+    agent_mod = sys.modules.get("qz_agent")
+    convert = getattr(agent_mod, "convert_plan_to_subtasks", convert_plan_to_subtasks) if agent_mod else convert_plan_to_subtasks
+    outcome["subtasks"] = convert(outcome["task"], outcome["plan"], outcome["architecture"], task_id=task_id)
+    return outcome

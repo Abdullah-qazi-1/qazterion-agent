@@ -97,9 +97,9 @@ class Phase9EndToEndTests(unittest.TestCase):
 
                 if model == "reasoner":
                     return response("NO_ISSUES")
-                if model == "groq-fast" and "Git commit subject" in messages[0]["content"]:
+                if model == "fast" and "Git commit subject" in messages[0]["content"]:
                     return response("Add calculator multiply function")
-                if model == "groq-fast":
+                if model == "fast":
                     return next(executor_responses)
                 raise AssertionError(f"Unexpected model call: {model}")
 

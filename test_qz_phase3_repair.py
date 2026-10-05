@@ -57,7 +57,6 @@ class Phase3RepairTests(unittest.TestCase):
              patch("qz_core.dag_executor.update_status"), \
              patch("qz_core.dag_executor.update_subtask_status"), \
              patch("qz_core.dag_executor.log_event"), \
-             patch("qz_core.dag_executor.select_route", return_value=("groq-fast", "KEY_1")), \
              patch("qz_core.dag_executor.request_completion") as mock_req, \
              patch.object(executor.val_pipeline, "run") as mock_val, \
              patch("subprocess.run") as mock_subproc:

@@ -443,17 +443,48 @@ class TaskManager:
         return events
 
     def get_latest_checkpoint(self, task_id: str) -> dict[str, Any] | None:
+        # Insertion order, not iteration_number: the attempt counter restarts per subtask.
         with self._session() as connection:
             row = connection.execute(
-                """
-                SELECT * FROM checkpoints
-                WHERE task_id = ?
-                ORDER BY iteration_number DESC, id DESC
-                LIMIT 1
-                """,
+                "SELECT * FROM checkpoints WHERE task_id = ? ORDER BY id DESC LIMIT 1",
                 (task_id,),
             ).fetchone()
         return _row_to_dict(row)
+
+    def get_checkpoint(self, checkpoint_id: int) -> dict[str, Any] | None:
+        with self._session() as connection:
+            row = connection.execute("SELECT * FROM checkpoints WHERE id = ?", (int(checkpoint_id),)).fetchone()
+        return _row_to_dict(row)
+
+    def list_checkpoints(self, task_id: str | None = None, workspace: str | None = None, limit: int = 10) -> list[dict[str, Any]]:
+        query = (
+            "SELECT c.*, t.user_request, t.workspace_path FROM checkpoints c "
+            "JOIN tasks t ON t.id = c.task_id WHERE 1 = 1"
+        )
+        params: list[Any] = []
+        if task_id:
+            query += " AND c.task_id = ?"
+            params.append(task_id)
+        if workspace:
+            query += " AND t.workspace_path = ?"
+            params.append(str(workspace))
+        query += " ORDER BY c.id DESC LIMIT ?"
+        params.append(int(limit))
+        with self._session() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def list_recent_tasks(self, workspace: str | None = None, limit: int = 15) -> list[dict[str, Any]]:
+        query = "SELECT * FROM tasks"
+        params: list[Any] = []
+        if workspace:
+            query += " WHERE workspace_path = ?"
+            params.append(str(workspace))
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self._session() as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_row_to_dict(row) for row in rows]
 
     def find_interrupted_tasks(self) -> list[dict[str, Any]]:
         placeholders = ", ".join("?" * len(TERMINAL_STATUSES))
@@ -587,3 +618,15 @@ def announce_interrupted_tasks(*, stream: TextIO | None = None, force: bool = Fa
         line = format_interrupted_notice(task)
         print(f"\033[93m[tasks]\033[0m {line}", file=stream, flush=True)
     return tasks
+
+
+def get_checkpoint(checkpoint_id: int) -> dict | None:
+    return get_manager().get_checkpoint(checkpoint_id)
+
+
+def list_checkpoints(task_id: str | None = None, workspace: str | None = None, limit: int = 10) -> list[dict]:
+    return get_manager().list_checkpoints(task_id=task_id, workspace=workspace, limit=limit)
+
+
+def list_recent_tasks(workspace: str | None = None, limit: int = 15) -> list[dict]:
+    return get_manager().list_recent_tasks(workspace=workspace, limit=limit)

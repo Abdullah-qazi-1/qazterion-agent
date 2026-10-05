@@ -10,7 +10,7 @@ class UsageTrackerTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.log_path = Path(self.temp_dir.name) / "usage.jsonl"
-        self.tracker = UsageTracker(log_path=self.log_path, cooldown_seconds=60.0)
+        self.tracker = UsageTracker(log_path=self.log_path)
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -40,33 +40,10 @@ class UsageTrackerTests(unittest.TestCase):
         self.assertEqual(summary["fallback_count"], 1)
         self.assertEqual(summary["last_error"], "RateLimitError")
 
-    def test_rate_limited_key_is_ineligible_until_cooldown_passes(self):
-        self.tracker.mark_rate_limited("GROQ_KEY_1")
-        self.assertFalse(self.tracker.is_key_eligible("GROQ_KEY_1"))
-        summary = self.tracker.summary()
-        self.assertEqual(summary["flagged_keys"]["GROQ_KEY_1"]["reason"], "rate_limited")
-        self.assertFalse(summary["flagged_keys"]["GROQ_KEY_1"]["eligible_again"])
-
-    def test_quota_exhausted_key_becomes_eligible_again_after_cooldown(self):
-        short_tracker = UsageTracker(log_path=None, cooldown_seconds=0.0, quota_cooldown_seconds=0.0)
-        short_tracker.mark_quota_exhausted("MISTRAL_KEY_1")
-        self.assertTrue(short_tracker.is_key_eligible("MISTRAL_KEY_1"))
-
-    def test_rate_limit_and_quota_cooldowns_are_independent(self):
-        # Rate limits clear quickly; quota exhaustion should not, even if the
-        # rate-limit cooldown has already elapsed. Each reason must use its
-        # own cooldown window instead of sharing one flat timer.
-        tracker = UsageTracker(log_path=None, cooldown_seconds=0.0, quota_cooldown_seconds=3600.0)
-        tracker.mark_rate_limited("GROQ_KEY_1")
-        tracker.mark_quota_exhausted("MISTRAL_KEY_1")
-        self.assertTrue(tracker.is_key_eligible("GROQ_KEY_1"))
-        self.assertFalse(tracker.is_key_eligible("MISTRAL_KEY_1"))
-
-    def test_successful_request_clears_an_existing_flag(self):
-        self.tracker.mark_rate_limited("GROQ_KEY_1")
-        self.tracker.record_request(model="groq-fast", key_id="GROQ_KEY_1", duration=0.2, success=True)
-        self.assertTrue(self.tracker.is_key_eligible("GROQ_KEY_1"))
-        self.assertNotIn("GROQ_KEY_1", self.tracker.summary()["flagged_keys"])
+    def test_key_names_are_shown_but_secret_looking_ids_are_masked(self):
+        self.tracker.record_request(model="groq/x", key_id="GROQ_KEY_2", duration=0.1, success=True)
+        self.assertEqual(self.tracker.summary()["last_key_id"], "GROQ_KEY_2")
+        self.assertIn("GROQ_KEY_2", self.tracker.summary()["by_key"])
 
     def test_events_are_persisted_to_the_log_file(self):
         self.tracker.record_request(model="groq-fast", duration=0.1, success=True)

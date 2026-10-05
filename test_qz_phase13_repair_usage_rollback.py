@@ -1,4 +1,4 @@
-"""Tests for Phase 13: Diagnostic Repair Loop, Usage & Cost Tracking, Rollback, and Telemetry."""
+"""Tests for Phase 13: diagnostic repair loop, usage & cost tracking, command aggregation."""
 
 import subprocess
 import tempfile
@@ -13,9 +13,9 @@ from qz_repair import (
 )
 from qz_usage_tracker import UsageTracker, calculate_estimated_cost
 from qz_recovery.resume_manager import ResumeManager, IntegrityStatus
-from qz_telemetry import TelemetryCollector
 from qz_validation.checks import CheckResult, CheckStatus
 from qz_validation.pipeline import ValidationReport
+from qz_sandbox.backend import _split_command_statements
 from qz_sandbox.manager import SandboxManager
 
 
@@ -133,7 +133,7 @@ class Phase13RepairUsageRollbackTests(unittest.TestCase):
         self.assertIn("approaching token limit", msg)
 
     def test_multi_command_aggregation(self):
-        sandbox = SandboxManager(docker_available=False)
+        sandbox = SandboxManager()
 
         # Command with failure in first command followed by second command
         cmd_failing_chain = 'python -c "import sys; sys.exit(42)"; echo finished'
@@ -149,12 +149,12 @@ class Phase13RepairUsageRollbackTests(unittest.TestCase):
         self.assertIn("step1", res_ok.stdout)
         self.assertIn("step2", res_ok.stdout)
 
-    def test_telemetry_and_benchmarks(self):
-        collector = TelemetryCollector()
-        collector.record_metric("task_duration", 12.5, task_id="t-1")
-        report = collector.generate_report()
-        self.assertIsInstance(report.to_dict(), dict)
-        self.assertIn("task_success_rate", report.to_dict())
+    def test_statement_splitter_keeps_blocks_intact(self):
+        parts = _split_command_statements("if ($true) { echo a; echo b }; echo c && echo d")
+        self.assertEqual([p for p, _ in parts], ["if ($true) { echo a; echo b }", "echo c", "echo d"])
+        self.assertEqual([sep for _, sep in parts], ["seq", "and", "last"])
+        quoted = _split_command_statements('python -c "a=1; b=2"; echo ok')
+        self.assertEqual(quoted[0][0], 'python -c "a=1; b=2"')
 
 
 if __name__ == "__main__":

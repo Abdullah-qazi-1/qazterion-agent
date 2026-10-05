@@ -26,7 +26,7 @@ class QzToolsTests(unittest.TestCase):
     def test_run_command_uses_powershell(self):
         from qz_sandbox.manager import SandboxManager
 
-        with patch("qz_tools.get_manager", return_value=SandboxManager(docker_available=False)):
+        with patch("qz_tools.get_manager", return_value=SandboxManager()):
             with patch("qz_sandbox.backend.subprocess.Popen") as popen_mock:
                 popen_mock.return_value.communicate.return_value = ("done", "")
                 popen_mock.return_value.returncode = 0
@@ -124,7 +124,15 @@ class QzToolsTests(unittest.TestCase):
                 qz_tools.write_file(".env", "API_KEY=secret\n")
                 result = qz_tools.commit_changes([".env"], "Never commit credentials")
                 self.assertIn("Sensitive file", result)
+                for name in ("a.py", "b.py"):
+                    qz_tools.write_file(name, "x = 1\n")
+                    self.assertIn("Git commit created", qz_tools.commit_changes([name], f"Add {name}"))
+                # An uncommitted edit to a tracked file blocks the undo...
+                with open(os.path.join(workspace, "a.py"), "w", encoding="utf-8") as handle:
+                    handle.write("x = 2  # user edit\n")
                 self.assertIn("Rollback refused", qz_tools.rollback_last_change())
+                # ...while the untracked .env never did (a reset cannot touch it).
+                self.assertTrue(os.path.exists(os.path.join(workspace, ".env")))
 
     def test_complexity_heuristic_and_command_failure_detection(self):
         with patch.object(qz_agent.client.chat.completions, "create", side_effect=RuntimeError("proxy unavailable")):
@@ -149,7 +157,7 @@ class QzToolsTests(unittest.TestCase):
         self.assertEqual(condensed[1]["role"], "user")
         self.assertIn("Steps 0-6 completed.", condensed[1]["content"])
         self.assertEqual([item["content"] for item in condensed[2:]], ["completed step 7", "completed step 8", "completed step 9"])
-        self.assertEqual(create.call_args.kwargs["model"], "groq-fast")
+        self.assertEqual(create.call_args.kwargs["model"], "fast")
 
     def test_rolling_summary_keeps_a_complete_tool_exchange(self):
         messages = [{"role": "system", "content": "rules"}]

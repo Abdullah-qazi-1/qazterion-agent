@@ -1,3 +1,5 @@
+> **Historical document.** Describes the architecture before 2.3.0 (LiteLLM proxy, `qz_pool`/`qz_router`, Docker sandbox, `qz_storage`). See README.md "Providers, Keys & Routing" and CHANGELOG.md 2.3.0 for the current design.
+
 # Qazterion (v2.2.0) — Technical Architecture & Audit Handover Brief
 
 > **Purpose:** This document is a complete, self-contained technical briefing for any AI assistant, auditor, or engineer inspecting, reviewing, or continuing development on **Qazterion**. It contains the system architecture, audit history, implemented remediations, security guarantees, test results, and operational context.

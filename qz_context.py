@@ -2,27 +2,18 @@
 
 from __future__ import annotations
 
-import math
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from qz_indexer import (
-    INDEX_FILENAME,
-    _doc_tokens,
-    _get_embedding_model,
-    _normalized_embeddings,
-    _query_embedding,
-    _symbol_tokens,
-    _cosine_similarity,
     load_or_build_index,
     search_chunks,
     search_index,
 )
 from qz_security.injection_guard import wrap_untrusted_content
-from qz_tools import WORKSPACE
+from qz_tools import current_workspace
 
 
 _TOKEN_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
@@ -101,7 +92,7 @@ class HybridRetriever:
     """Combines exact text, symbol search, path relevance, AST dependencies, and semantic search."""
 
     def __init__(self, workspace: str | Path | None = None) -> None:
-        self.workspace = Path(workspace or WORKSPACE).resolve()
+        self.workspace = Path(workspace or current_workspace()).resolve()
 
     def retrieve(
         self,
@@ -186,11 +177,13 @@ class ContextBudgetManager:
             return self.default_budget
 
         try:
-            from qz_providers.model_registry import get_model_registry
-            meta = get_model_registry().get_model_by_alias(model_alias)
-            if meta and meta.context_window:
-                # Reserve 40% for system prompt, user instructions, conversation turns, and generation
-                budget = int(meta.context_window * self.max_context_ratio)
+            from qz_providers.catalog import ProviderCatalog
+
+            windows = [m.context_window for m in ProviderCatalog().candidates(model_alias) if m.context_window]
+            if windows:
+                # Any model in the role may serve the request, so budget for the
+                # smallest window; reserve the rest for prompt, history and output.
+                budget = int(min(windows) * self.max_context_ratio)
                 return max(2000, min(budget, 32000))
         except Exception:
             pass
@@ -205,7 +198,7 @@ class ContextBudgetManager:
         critical_files: list[str] | None = None,
     ) -> RetrievedContext:
         """Retrieve, rank, deduplicate, and fit context within the token budget."""
-        ws = Path(workspace or WORKSPACE).resolve()
+        ws = Path(workspace or current_workspace()).resolve()
         budget = self.calculate_budget(model_alias)
         retriever = HybridRetriever(ws)
 

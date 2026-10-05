@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
-import os
-import shutil
 import subprocess
 import sys
 import threading
@@ -16,28 +13,21 @@ from typing import Any
 import uuid
 
 
-def _runtime_config_path() -> Path:
-    """Return a writable config copy for desktop/one-file builds."""
-    data_dir = os.environ.get("QAZTERION_DATA_DIR")
-    if not data_dir:
-        return ROOT / "config.yaml"
-    destination = Path(data_dir) / "config.yaml"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if not destination.exists():
-        source = ROOT / "config.yaml"
-        if source.exists():
-            shutil.copy2(source, destination)
-    return destination
-
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import qz_agent
-import qz_tools
-from qz_desktop_backend import DesktopBackend
-from qz_recovery import get_resume_manager
-from qz_security.gateway import configure as configure_security_gateway
+from qz_paths import load_environment  # noqa: E402
+from qz_sandbox.backend import NO_WINDOW  # noqa: E402
+
+load_environment()
+
+import qz_agent  # noqa: E402
+import qz_tools  # noqa: E402
+from qz_core.common import TaskContext, task_context_scope  # noqa: E402
+from qz_desktop_backend import DesktopBackend  # noqa: E402
+from qz_recovery import get_resume_manager  # noqa: E402
+from qz_security.gateway import configure as configure_security_gateway  # noqa: E402
 from qz_tasks.task_manager import (
     announce_interrupted_tasks,
     find_interrupted_tasks,
@@ -46,6 +36,18 @@ from qz_tasks.task_manager import (
     log_event,
     subscribe_events,
 )
+
+
+# The protocol stream to Electron. Captured once at import so nothing that later
+# reassigns sys.stdout (or prints from worker threads) can corrupt the framing.
+_PROTOCOL_OUT = sys.stdout
+_PROTOCOL_LOCK = threading.Lock()
+
+
+def _protocol_write(line: str) -> None:
+    with _PROTOCOL_LOCK:
+        _PROTOCOL_OUT.write(line + "\n")
+        _PROTOCOL_OUT.flush()
 
 
 def _emit_task_event(task_id: str, event_type: str, payload: dict | None, timestamp: str) -> None:
@@ -57,7 +59,7 @@ def _emit_task_event(task_id: str, event_type: str, payload: dict | None, timest
         "payload": payload or {},
     }
     try:
-        print("__QZ_EVENT__" + json.dumps(event_data, default=str), flush=True)
+        _protocol_write("__QZ_EVENT__" + json.dumps(event_data, default=str))
     except Exception:
         pass
 
@@ -184,9 +186,12 @@ def create_desktop_ask_handler(
             except Exception:
                 pass
 
-        out = output_stream or sys.stdout
         try:
-            print("__QZ_PERMISSION__" + json.dumps(perm_data, default=str), file=out, flush=True)
+            line = "__QZ_PERMISSION__" + json.dumps(perm_data, default=str)
+            if output_stream is not None:
+                print(line, file=output_stream, flush=True)
+            else:
+                _protocol_write(line)
         except Exception:
             pass
 
@@ -294,16 +299,51 @@ def _interrupted_task_payload() -> list[dict[str, Any]]:
         })
     return notices
 APP_VERSION = "0.1.0"
-_approved_changes: dict[str, dict[str, Any]] = {}
+def _approve_changes(ws: Path, task_id: str, files: list) -> dict[str, Any]:
+    """Record the user's review of a task's changed files in the task's audit log.
+
+    This is an acknowledgement only: it validates the files (inside the workspace,
+    belonging to a known task of that workspace) and persists a CHANGES_APPROVED
+    event. It never stages, commits or modifies anything.
+    """
+    from qz_security.workspace_guard import WorkspacePathError, resolve_workspace_path
+    from qz_tasks.task_manager import get_task
+
+    task = get_task(task_id)
+    if task is None:
+        raise ValueError(f"Unknown task '{task_id}'.")
+    if Path(task.get("workspace_path") or "").resolve() != ws:
+        raise ValueError("The task belongs to a different workspace.")
+    approved: list[str] = []
+    for item in files:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        try:
+            full = resolve_workspace_path(item, ws)
+        except WorkspacePathError as error:
+            raise ValueError(f"Refusing to approve a path outside the workspace: {item}") from error
+        approved.append(full.relative_to(ws).as_posix())
+    approved = sorted(set(approved))
+    approved_at = datetime.now().isoformat(timespec="seconds")
+    log_event(task_id, "CHANGES_APPROVED", {"files": approved, "approved_at": approved_at})
+    return {"message": f"Recorded approval for {len(approved)} changed file(s).", "files": approved, "approvedAt": approved_at}
 
 
 def _workspace(value: str | None) -> Path:
-    path = Path(value or ROOT).resolve()
+    """Validate a workspace path. RPC handlers run concurrently, so this never
+    touches process-wide state; code that needs an implicit workspace runs inside
+    ``task_context_scope`` instead."""
+    if not value:
+        raise ValueError("A workspace is required.")
+    path = Path(value).resolve()
     if not path.is_dir():
         raise ValueError("Selected project directory does not exist.")
-    qz_agent.WORKSPACE = str(path)
-    qz_tools.WORKSPACE = str(path)
     return path
+
+
+def _in_workspace(ws: Path, fn):
+    with task_context_scope(TaskContext(task_id="rpc", workspace=ws)):
+        return fn()
 
 
 def _git(workspace: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -316,6 +356,8 @@ def _git(workspace: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
         errors="replace",
         check=False,
         env=sanitize_subprocess_env(str(workspace)),
+        stdin=subprocess.DEVNULL,
+        creationflags=NO_WINDOW,
     )
 
 
@@ -337,8 +379,8 @@ def _diffs(workspace: Path) -> dict[str, list[dict[str, Any]]]:
 
 
 def _usage(backend: DesktopBackend) -> dict[str, Any]:
-    events = list(backend.usage_tracker._events)[-50:]
-    all_events = list(backend.usage_tracker._events)
+    all_events = backend.usage_tracker.recent_events(limit=1000)
+    events = all_events[-50:]
     total = len(events)
     total_tokens = sum(int(e.get("total_tokens") or 0) for e in all_events)
     prompt_tokens = sum(int(e.get("input_tokens") or 0) for e in all_events)
@@ -375,23 +417,34 @@ def _usage(backend: DesktopBackend) -> dict[str, Any]:
 
 def _diagnostics(backend: DesktopBackend) -> dict[str, Any]:
     st = backend.status()
-    logs = list(st["proxy"].get("log_tail", []))
+    routing = st.get("routing", {})
+    logs = [
+        f"{e.get('model')} [{e.get('key_id')}] {e.get('error')}"
+        for e in backend.usage_tracker.recent_events(limit=200) if not e.get("success")
+    ][-30:]
     notifications: list[dict[str, str]] = []
 
-    proxy_state = str(st["proxy"].get("state", "offline"))
-    is_healthy = bool(st["proxy"].get("healthy", False))
-    if is_healthy:
+    if st["proxy"].get("healthy"):
+        usable_roles = [role for role, info in routing.get("roles", {}).items() if info.get("usable")]
         notifications.append({
             "level": "success",
-            "title": "AI Proxy Active",
-            "detail": f"Local proxy is healthy on port 4000 with {len(st.get('aliases', []))} active model(s).",
+            "title": "Providers Connected",
+            "detail": f"Direct provider access ready; {len(usable_roles)} role(s) have usable models.",
         })
     else:
         notifications.append({
             "level": "info",
-            "title": "Proxy Ready (" + proxy_state + ")",
-            "detail": "Configure an API key in API & Models to activate dynamic routing.",
+            "title": "No Usable API Key",
+            "detail": "Add a provider key in API & Models to start.",
         })
+    for provider in routing.get("providers", []):
+        for key in provider.get("keys", []):
+            if key.get("disabled_reason"):
+                notifications.append({
+                    "level": "warning",
+                    "title": f"{key['key_id']} rejected",
+                    "detail": "The provider rejected this key (invalid or expired). Replace it to use it again.",
+                })
 
     entries = backend.keystore.list_entries()
     enabled_keys = sum(1 for e in entries if e.enabled)
@@ -442,7 +495,6 @@ def _import_env_keys(backend: DesktopBackend, workspace: Path) -> dict[str, Any]
 def _dispatch(backend: DesktopBackend, method: str, params: dict[str, Any]) -> Any:
     if method == "status":
         st = backend.status()
-        state = str(st["proxy"].get("state", "offline")).lower()
         is_healthy = bool(st["proxy"].get("healthy", False))
         aliases = st.get("aliases", [])
         configured_providers = {}
@@ -466,10 +518,12 @@ def _dispatch(backend: DesktopBackend, method: str, params: dict[str, Any]) -> A
                 first_key = keys_list[0].get("masked_value", "••••••••••••") if keys_list else "••••••••••••"
                 configured_providers[str(prov_name)] = {"count": int(prov_info.get("configured") or 0), "masked": first_key}
 
-        active_model = aliases[0] if (aliases and is_healthy) else ("No Active Model" if not is_healthy else "Ready")
+        coder = st.get("routing", {}).get("roles", {}).get("coder", {}).get("usable") or []
+        active_model = coder[0] if coder else ("No Active Model" if not is_healthy else "Ready")
 
         return {
             "proxyStatus": "healthy" if is_healthy else "offline",
+            "transport": "direct",
             "model": active_model,
             "connected": is_healthy,
             "aliases": aliases,
@@ -508,7 +562,7 @@ def _dispatch(backend: DesktopBackend, method: str, params: dict[str, Any]) -> A
         ws = _workspace(str(raw_workspace))
         requested, head = str(params.get("commitHash", "")), _git(ws, ["rev-parse", "HEAD"])
         if head.returncode or not requested or not head.stdout.strip().startswith(requested): raise ValueError("Only the current HEAD commit can be rolled back.")
-        result = qz_tools.rollback_last_change()
+        result = _in_workspace(ws, qz_tools.rollback_last_change)
         if not result.startswith("Rollback complete:"): raise RuntimeError(result)
         return {"message": result}
     if method == "approve_changes":
@@ -516,9 +570,7 @@ def _dispatch(backend: DesktopBackend, method: str, params: dict[str, Any]) -> A
         if not raw_workspace or not task_id or not isinstance(files, list):
             raise ValueError("A workspace, task ID, and changed-file list are required to approve changes.")
         ws = _workspace(str(raw_workspace))
-        safe_files = [str(item) for item in files if isinstance(item, str)]
-        _approved_changes[task_id] = {"workspace": str(ws), "files": safe_files, "approved_at": datetime.now().isoformat(timespec="seconds")}
-        return {"message": f"Recorded approval for {len(safe_files)} changed file(s)."}
+        return _approve_changes(ws, task_id, files)
     if method == "check_for_updates":
         # This build has no signed release feed configured. Return an honest backend result instead of simulating an update.
         return {"available": False, "currentVersion": APP_VERSION, "latestVersion": None, "message": "No signed update feed is configured for this build."}
@@ -566,8 +618,9 @@ def _dispatch(backend: DesktopBackend, method: str, params: dict[str, Any]) -> A
         raw_ws = params.get("workspace")
         ws = _workspace(str(raw_ws)) if raw_ws else None
         mgr = get_resume_manager(ws)
-        outcome = mgr.resume_task(str(raw_task_id), workspace=ws, decision=decision)
-        return outcome.to_dict()
+        if ws is None:
+            return mgr.resume_task(str(raw_task_id), decision=decision).to_dict()
+        return _in_workspace(ws, lambda: mgr.resume_task(str(raw_task_id), workspace=ws, decision=decision)).to_dict()
     if method in ("get_providers", "getProviders"):
         return backend.get_providers()
     if method in ("set_provider_enabled", "setProviderEnabled"):
@@ -586,7 +639,8 @@ def _dispatch(backend: DesktopBackend, method: str, params: dict[str, Any]) -> A
         model_id = str(params.get("modelId", params.get("model_id", "")))
         return backend.set_preferred_model(alias, prov, model_id)
     if method in ("get_enabled_env", "getEnabledEnv"):
-        return backend.keystore.enabled_env()
+        # Decrypted secrets never leave the backend process.
+        raise PermissionError("get_enabled_env was removed: API keys are never sent to the UI.")
     if method in ("add_provider_key", "addProviderKey"):
         prov = str(params.get("provider", ""))
         index = int(params.get("index", 1))
@@ -620,8 +674,7 @@ def _dispatch(backend: DesktopBackend, method: str, params: dict[str, Any]) -> A
     if method in ("get_intelligence", "getIntelligence"):
         return backend.intelligence_summary()
     if method in ("get_benchmark_report", "getBenchmarkReport"):
-        from qz_telemetry import get_telemetry_collector
-        return get_telemetry_collector().generate_report().to_dict()
+        return backend.benchmark_report()
     if method in ("preview_rollback", "previewRollback"):
         raw_task_id = str(params.get("taskId", ""))
         ckpt_id = params.get("checkpointId")
@@ -648,7 +701,7 @@ def _dispatch(backend: DesktopBackend, method: str, params: dict[str, Any]) -> A
         raw_ws = params.get("workspace")
         ws = _workspace(str(raw_ws)) if raw_ws else None
         from qz_context import ContextBudgetManager
-        ctx = ContextBudgetManager().select_context(query, workspace=ws)
+        ctx = ContextBudgetManager().select_context(query, workspace=ws or Path.cwd())
         return {
             "query": query,
             "totalTokens": ctx.total_tokens,
@@ -661,7 +714,16 @@ def _dispatch(backend: DesktopBackend, method: str, params: dict[str, Any]) -> A
     if method in ("check_system_health", "checkSystemHealth"):
         raw_ws = params.get("workspace")
         ws = _workspace(str(raw_ws)) if raw_ws else None
-        return backend.check_health(workspace=ws)
+        res = backend.check_health(workspace=str(ws) if ws else None)
+        # Kept in desktop RPC so desktop builds reading components.docker keep working; Docker is not used.
+        res.setdefault("components", {})["docker"] = {
+            "name": "Docker (not used)",
+            "status": "healthy",
+            "available": False,
+            "details": "Not required: Qazterion runs commands on the host and never uses Docker.",
+            "metadata": {"isolation": "host", "required": False},
+        }
+        return res
     if method in ("test_provider_connectivity", "testProviderConnectivity"):
         prov = str(params.get("provider", ""))
         val = str(params.get("key", params.get("value", "")))
@@ -683,6 +745,9 @@ _KEYSTORE_WRITE_METHODS = {
     "register_custom_provider", "registerCustomProvider",
     "first_run_setup", "import_env_keys",
     "generate_configuration", "set_routing_strategy",
+    "set_provider_enabled", "setProviderEnabled",
+    "set_preferred_model", "setPreferredModel",
+    "refresh_models", "refreshModels",
 }
 
 # Slow / network-bound methods. These are the ones that used to freeze the
@@ -696,22 +761,32 @@ _NETWORK_METHODS = {
 }
 
 _WRITE_LOCK = threading.Lock()
-_STDOUT_LOCK = threading.Lock()
+
+
+def _json_safe(value: Any) -> Any:
+    """Make a result strictly JSON-parseable (JavaScript rejects NaN/Infinity)."""
+    if isinstance(value, float):
+        return value if value == value and value not in (float("inf"), float("-inf")) else None
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 def _send_response(response: dict[str, Any]) -> None:
-    # print() itself writes atomically for short lines, but two threads
-    # calling it back-to-back on a *slow* pipe can still interleave partial
-    # writes and corrupt the JSON-RPC framing on the Electron side. One lock
-    # around the actual write removes that risk entirely.
-    with _STDOUT_LOCK:
-        print(json.dumps(response, default=str), flush=True)
+    try:
+        line = json.dumps(_json_safe(response), default=str, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        line = json.dumps({"id": response.get("id"), "ok": False,
+                           "error": {"message": f"Result could not be serialized: {error}"}}, default=str)
+    _protocol_write(line)
 
 
 def _handle_request(backend: DesktopBackend, line: str) -> None:
     request: dict[str, Any] = {}
     try:
-        request = json.loads(line)
+        request = json.loads(line.lstrip("\ufeff"))
         if not isinstance(request, dict):
             raise ValueError("Request must be an object.")
         params = request.get("params", {})
@@ -719,22 +794,27 @@ def _handle_request(backend: DesktopBackend, line: str) -> None:
             raise ValueError("params must be an object.")
         method = str(request.get("method", ""))
         sys.stderr.write(f"[RPC REQ] id={request.get('id')} method={method}\n")
-        with contextlib.redirect_stdout(sys.stderr):
-            if method in _KEYSTORE_WRITE_METHODS:
-                with _WRITE_LOCK:
-                    result = _dispatch(backend, method, params)
-            else:
+        if method in _KEYSTORE_WRITE_METHODS:
+            with _WRITE_LOCK:
                 result = _dispatch(backend, method, params)
+        else:
+            result = _dispatch(backend, method, params)
         response = {"id": request.get("id"), "ok": True, "result": result}
         sys.stderr.write(f"[RPC OK] id={request.get('id')} method={method}\n")
     except Exception as error:
-        sys.stderr.write(f"[RPC ERR] id={request.get('id')} method={request.get('method')} error={error}\n")
-        response = {"id": request.get("id"), "ok": False, "error": {"message": str(error)}}
+        from qz_security.redaction import redact
+
+        message = redact(str(error)) or type(error).__name__
+        sys.stderr.write(f"[RPC ERR] id={request.get('id')} method={request.get('method')} error={message}\n")
+        response = {"id": request.get("id") if isinstance(request, dict) else None, "ok": False,
+                    "error": {"message": message, "type": type(error).__name__}}
     _send_response(response)
 
 
 def rpc_main() -> int:
-    backend = DesktopBackend(config_path=_runtime_config_path())
+    # Anything printed by library code goes to stderr; replies use _PROTOCOL_OUT.
+    sys.stdout = sys.stderr
+    backend = DesktopBackend()
     announce_interrupted_tasks(stream=sys.stderr)
     # Each request now runs on its own worker thread. Previously this was a
     # bare `for line in sys.stdin: ... dispatch synchronously ... print()`
@@ -753,13 +833,24 @@ def rpc_main() -> int:
     return 0
 
 
+def _configure_stdio() -> None:
+    """Use UTF-8 on the pipes to Electron.
+
+    On Windows, piped stdio otherwise uses the ANSI code page (cp1252): non-ASCII
+    paths, prompts or keys from the UI would be mis-decoded, and printing model
+    output with non-ASCII characters could raise UnicodeEncodeError.
+    """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
+
+
 def main() -> int:
     global _active_task_id
-    import multiprocessing
-    multiprocessing.freeze_support()
-    from qz_proxy_manager import RUN_LITELLM_PROXY_FLAG, run_embedded_litellm_proxy
-    if RUN_LITELLM_PROXY_FLAG in sys.argv:
-        return run_embedded_litellm_proxy(sys.argv[1:])
+    _configure_stdio()
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace"); parser.add_argument("--task"); parser.add_argument("--rpc", action="store_true")
     parser.add_argument("--mode", choices=qz_agent.TASK_MODES); parser.add_argument("--approval", choices=("always", "complex", "never"), default="never")
@@ -768,6 +859,8 @@ def main() -> int:
     if not args.workspace or not args.task: parser.error("--workspace and --task are required unless --rpc is used")
     announce_interrupted_tasks(stream=sys.stderr)
     workspace = _workspace(args.workspace)
+    qz_agent.WORKSPACE = str(workspace)
+    qz_tools.WORKSPACE = str(workspace)
     qz_agent.PLAN_APPROVAL_SETTING = args.approval
     qz_agent.FORCED_TASK_MODE = args.mode
 
@@ -782,7 +875,7 @@ def main() -> int:
     _active_task_id = task_id
     configure_security_gateway(ask_handler=create_desktop_ask_handler(task_id))
     qz_agent._persist_task(task_id, lambda: qz_agent.update_status(task_id, qz_agent.TaskStatus.ANALYZING, current_step="analyzing"))
-    qz_agent.prepare_environment(auto_setup=False)
+    qz_agent.prepare_environment(auto_setup=False, workspace=str(workspace))
     qz_agent.ensure_git_repository()
     baseline = qz_agent.capture_pre_existing_test_failures()
     index, _ = qz_agent.load_or_build_index(qz_agent.WORKSPACE)
@@ -790,7 +883,7 @@ def main() -> int:
     qz_agent._persist_task(task_id, lambda: qz_agent.log_event(task_id, "TASK_CLASSIFIED", {"mode": mode}))
     outcome = qz_agent.resolve_plan(
         args.task, qz_agent.format_index_summary(index), "never", mode,
-        interactive_clarifications=False, task_id=task_id,
+        interactive_clarifications=False, task_id=task_id, build_dag=False,
     )
     should_pause = qz_agent.requires_plan_approval(mode, args.approval)
     if should_pause:
@@ -798,20 +891,27 @@ def main() -> int:
             task_id, qz_agent.TaskStatus.WAITING_APPROVAL, current_step="waiting_approval",
         ))
         qz_agent._persist_task(task_id, lambda: qz_agent.log_event(task_id, "WAITING_APPROVAL", {"mode": mode}))
-        print("__QZ_PLAN__" + json.dumps({"task": outcome["task"], "plan": outcome["plan"], "architecture": outcome["architecture"], "mode": mode}), flush=True)
+        _protocol_write("__QZ_PLAN__" + json.dumps({"task": outcome["task"], "plan": outcome["plan"], "architecture": outcome["architecture"], "mode": mode}))
         try:
-            response = json.loads(sys.stdin.readline())
+            # Same single stdin reader as permission prompts, so no line is lost.
+            response = json.loads(_read_line_with_timeout(sys.stdin, timeout=None) or "{}")
+            if not isinstance(response, dict):
+                response = {"decision": "reject"}
         except Exception:
             response = {"decision": "reject"}
-        decision = str(response.get("decision", "reject"))
-        if decision == "reject":
+        # Same contract as earlier desktop builds: anything but an explicit
+        # rejection proceeds; a missing/unparseable reply counts as rejection.
+        decision = str(response.get("decision") or "reject").strip().lower()
+        if decision in ("reject", "rejected", "cancel", "deny", "no"):
             qz_agent._persist_task(task_id, lambda: qz_agent.update_status(task_id, qz_agent.TaskStatus.CANCELLED, current_step="cancelled"))
             qz_agent._persist_task(task_id, lambda: qz_agent.log_event(task_id, "TASK_CANCELLED", {"reason": "plan_rejected"}))
             print("Task rejected by user before implementation.", flush=True)
             return 0
-        if decision == "edit" and isinstance(response.get("plan"), str) and response["plan"].strip():
-            outcome["plan"] = response["plan"].strip()
+        edited = response.get("plan") if decision == "edit" and isinstance(response.get("plan"), str) else None
+        qz_agent.finalize_plan(outcome, task_id=task_id, plan=edited)
         qz_agent._persist_task(task_id, lambda: qz_agent.log_event(task_id, "APPROVAL_RECEIVED", {"decision": decision}))
+    else:
+        qz_agent.finalize_plan(outcome, task_id=task_id)
     print(qz_agent.run_executor(
         outcome["task"], outcome["plan"], outcome["architecture"],
         test_baseline=baseline, task_id=task_id,

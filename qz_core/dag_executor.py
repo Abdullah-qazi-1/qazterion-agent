@@ -8,8 +8,6 @@ bounded repair loop, dependency output propagation, and atomic state transitions
 from __future__ import annotations
 
 import json
-import re
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,13 +16,9 @@ from typing import Any
 from openai import OpenAI
 
 import qz_core.executor as executor_mod
-from qz_core.client import get_client
 from qz_core.common import _persist_task
 from qz_core.git_ops import generate_commit_message, _commit_hash_from_result
 from qz_core.executor import TestBaseline
-from qz_indexer import format_index_summary, load_or_build_index
-from qz_pool import get_pool
-from qz_router import get_router
 from qz_security.redaction import redact
 from qz_tasks.models import SubtaskStatus, TaskStatus
 from qz_tasks.task_manager import (
@@ -41,27 +35,15 @@ from qz_tasks.task_manager import (
 )
 import qz_tools
 from qz_tools import TOOL_FUNCTIONS, TOOL_SCHEMAS, commit_changes
-from qz_validation import CheckStatus, ValidationReport
 
-# NOTE ON PATCHING: classify_task_complexity, select_route, request_completion
-# and _task_requires_test_changes are wrapped below rather than imported by
-# name. Some tests patch them at "qz_core.dag_executor.<name>" (this module's
-# own attribute) while others patch "qz_core.executor.<name>" (the original
-# home module). A plain `from qz_core.executor import request_completion`
-# would bind a private reference here that neither style of patch could
-# reach, silently falling back to real network calls. The wrapper functions
-# below are themselves patchable module attributes on qz_core.dag_executor,
-# and when *not* patched here they forward the call dynamically (looked up
-# at call time, not import time) to qz_core.executor, so a patch applied
-# there is honored too.
+# classify_task_complexity, request_completion and _task_requires_test_changes
+# are thin wrappers that look the real function up on qz_core.executor at call
+# time, so tests can patch either "qz_core.dag_executor.<name>" or
+# "qz_core.executor.<name>".
 
 
 def classify_task_complexity(*args: Any, **kwargs: Any) -> Any:
     return executor_mod.classify_task_complexity(*args, **kwargs)
-
-
-def select_route(*args: Any, **kwargs: Any) -> Any:
-    return executor_mod.select_route(*args, **kwargs)
 
 
 def request_completion(*args: Any, **kwargs: Any) -> Any:
@@ -70,6 +52,24 @@ def request_completion(*args: Any, **kwargs: Any) -> Any:
 
 def _task_requires_test_changes(*args: Any, **kwargs: Any) -> Any:
     return executor_mod._task_requires_test_changes(*args, **kwargs)
+
+
+def select_role(complexity: str) -> str:
+    """Map a complexity label to the provider-catalog role used for a node."""
+    return executor_mod.COMPLEXITY_MODEL_MAP.get(str(complexity).lower(), executor_mod.EXECUTOR_ROLE)
+
+
+_TOOL_FAILURE_PREFIXES = (
+    "TOOL_ARGUMENT_ERROR",
+    "Denied by security policy",
+    "Could not apply",
+    "Write refused",
+    "Patch refused",
+    "Command refused",
+    "Could not start command",
+    "Tool ",
+    "Unknown tool",
+)
 
 
 @dataclass
@@ -171,7 +171,7 @@ class HardDAGExecutor:
         # without an explicit `workspace=` to silently run against whatever
         # directory was current process-wide at import time (e.g. the real
         # repo checkout) instead of the caller's intended workspace.
-        self.workspace = Path(workspace or qz_tools.WORKSPACE).resolve()
+        self.workspace = Path(workspace or qz_tools.current_workspace()).resolve()
         self.max_node_retries = max_node_retries
         self.max_node_iterations = max_node_iterations
         self.client = client
@@ -189,31 +189,15 @@ class HardDAGExecutor:
         dependency_outputs: list[dict[str, Any]],
         test_baseline: TestBaseline | None = None,
     ) -> NodeResult:
-        """Execute a single active DAG node within strict execution boundaries and a bounded repair loop."""
+        """Execute one DAG node: tool loop, validation gate, bounded repair."""
         node_id = str(node["id"])
         node_title = str(node.get("title") or f"Subtask {node_id}")
         node_desc = str(node.get("description") or node_title)
 
         start_time = time.monotonic()
         complexity = classify_task_complexity(f"{overall_task}\n{node_title}\n{node_desc}")
-        model_alias, chosen_key = select_route(complexity, task_id=task_id, requires_tools=True)
-
-        model_meta = None
-        try:
-            from qz_providers.model_registry import get_model_registry
-            model_meta = get_model_registry().get_model_by_alias(model_alias)
-        except ImportError:
-            pass
-
-        if model_meta:
-            provider_id = model_meta.provider
-            model_id = model_meta.model_id
-            model_display_name = model_meta.display_name
-        else:
-            provider_id = model_alias.split("/")[0] if "/" in model_alias else model_alias
-            model_id = model_alias
-            model_display_name = model_alias
-        key_identity = chosen_key
+        model_role = select_role(complexity)
+        route = {"provider_id": "", "model_id": "", "model_display_name": model_role, "key_identity": ""}
 
         dep_context = _format_dependency_context(dependency_outputs)
         node_acceptance_criteria = (
@@ -223,23 +207,19 @@ class HardDAGExecutor:
             f"3. Do NOT execute or complete future subtasks; focus strictly on this node."
         )
 
-        # Phase 13: Project rules and persistent repository context
         try:
             from qz_security.rules_loader import load_project_rules
-            project_rules = load_project_rules(self.workspace)
-            rules_prompt = project_rules.format_for_prompt()
+            rules_prompt = load_project_rules(self.workspace).format_for_prompt()
         except Exception:
             rules_prompt = ""
 
-        # Phase 13: Hybrid context retrieval & budget management
         context_prompt = ""
         try:
             from qz_context import ContextBudgetManager
-            ctx_mgr = ContextBudgetManager()
-            ctx = ctx_mgr.select_context(
+            ctx = ContextBudgetManager().select_context(
                 f"{overall_task} {node_title} {node_desc}",
                 workspace=self.workspace,
-                model_alias=model_alias,
+                model_alias=model_role,
             )
             context_prompt = ctx.format_for_prompt()
             if ctx.files or ctx.snippets:
@@ -266,54 +246,63 @@ class HardDAGExecutor:
             "Instruction: Implement and verify ONLY this active node step-by-step. "
             "When done and verified, provide a concise summary of your work."
         )
-
-        user_prompt = "\n".join(prompt_parts)
-
         messages = [
             {"role": "system", "content": executor_mod.SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": "\n".join(prompt_parts)},
         ]
 
         attempt = 1
         consecutive_failures = 0
         escalated = False
-        active_model = model_alias
+        active_model = model_role
 
         node_changes: list[dict[str, Any]] = []
         node_commands: list[str] = []
         node_tests: list[str] = []
+        last_command_output: str | None = None
         files_touched_set: set[str] = set()
-        agent_created_this_node: set[str] = set()
-        test_changes_required = _task_requires_test_changes(f"{overall_task} {node_title}")
-        test_file_changed = False
         last_turn_response = ""
-        execution_succeeded = True
 
         try:
-            from qz_repair import RepairHistory, classify_failure
+            from qz_repair import RepairHistory
             repair_history = RepairHistory()
         except Exception:
             repair_history = None
 
+        qz_tools.begin_change_tracking()
+
+        def result(status: str, summary: str, **extra: Any) -> NodeResult:
+            return NodeResult(
+                node_id=node_id,
+                status=status,
+                summary=summary,
+                files_changed=node_changes,
+                commands_executed=node_commands,
+                tests_run=node_tests,
+                duration=time.monotonic() - start_time,
+                model_used=active_model,
+                provider_id=route["provider_id"],
+                model_id=route["model_id"],
+                model_display_name=route["model_display_name"],
+                key_identity=route["key_identity"],
+                attempts=attempt,
+                **extra,
+            )
+
+        def cancelled() -> NodeResult:
+            update_subtask_status(node_id, SubtaskStatus.CANCELLED, attempts=attempt)
+            log_event(task_id, "NODE_CANCELLED", {"subtask_id": node_id, "title": node_title})
+            log_event(task_id, "dag.node.cancelled", {"subtask_id": node_id, "title": node_title})
+            return result(SubtaskStatus.CANCELLED, "Node execution cancelled by user.")
+
         while attempt <= self.max_node_retries:
             if self._is_task_cancelled(task_id):
-                update_subtask_status(node_id, SubtaskStatus.CANCELLED, attempts=attempt)
-                log_event(task_id, "NODE_CANCELLED", {"subtask_id": node_id, "title": node_title})
-                log_event(task_id, "dag.node.cancelled", {"subtask_id": node_id, "title": node_title})
-                return NodeResult(
-                    node_id=node_id,
-                    status=SubtaskStatus.CANCELLED,
-                    summary="Node execution cancelled by user.",
-                    duration=time.monotonic() - start_time,
-                    attempts=attempt,
-                )
+                return cancelled()
 
-            # Node turn loop
             model_request_error: str | None = None
-            execution_succeeded = True
             for iteration in range(self.max_node_iterations):
                 if self._is_task_cancelled(task_id):
-                    break
+                    return cancelled()
 
                 messages, _ = executor_mod.roll_conversation_summary(messages, client=self.client)
                 _persist_task(task_id, lambda: update_status(
@@ -323,23 +312,28 @@ class HardDAGExecutor:
                 ))
 
                 try:
-                    resp, used_model = request_completion(
+                    resp, _used_role = request_completion(
                         model=active_model,
                         messages=messages,
                         tools=TOOL_SCHEMAS,
                         temperature=0.2,
-                        fallbacks=executor_mod.EXECUTOR_FALLBACKS.get(active_model, (active_model,)),
                         client=self.client,
                         task_id=task_id,
                     )
-                    if used_model != active_model:
-                        active_model = used_model
-                        log_event(task_id, "MODEL_FALLBACK", {"from": model_alias, "to": active_model})
                 except Exception as e:
-                    model_request_error = str(e)
-                    print(f"\033[91m[node {node_id}]\033[0m Model request failed: {e}")
-                    log_event(task_id, "NODE_ERROR", {"subtask_id": node_id, "error": str(e)})
+                    model_request_error = redact(str(e))
+                    print(f"\033[91m[node {node_id}]\033[0m Model request failed: {model_request_error}")
+                    log_event(task_id, "NODE_ERROR", {"subtask_id": node_id, "error": model_request_error})
                     break
+
+                route_info = getattr(resp, "route", None)
+                if route_info is not None and getattr(route_info, "provider", None):
+                    route.update(
+                        provider_id=route_info.provider,
+                        model_id=route_info.model,
+                        model_display_name=f"{route_info.provider}/{route_info.model}",
+                        key_identity=route_info.key_id,
+                    )
 
                 msg = resp.choices[0].message
                 if hasattr(msg, "model_dump"):
@@ -347,103 +341,85 @@ class HardDAGExecutor:
                 elif isinstance(msg, dict):
                     msg_dict = msg
                 else:
-                    msg_dict = vars(msg)
-                clean_msg = {
+                    msg_dict = dict(vars(msg))
+                messages.append({
                     k: v for k, v in msg_dict.items()
                     if k in ("role", "content", "tool_calls", "name", "tool_call_id", "function_call")
-                }
-                messages.append(clean_msg)
+                })
 
-                tool_calls = msg.tool_calls or []
+                tool_calls = getattr(msg, "tool_calls", None) or []
                 if not tool_calls:
-                    last_turn_response = msg.content or ""
-                    execution_succeeded = True
+                    last_turn_response = getattr(msg, "content", "") or ""
                     break
 
                 iteration_failed = None
                 for tool_call in tool_calls:
-                    fname = tool_call.function.name
-                    parse_error = None
+                    fname = str(getattr(tool_call.function, "name", "") or "")
+                    tool_args: dict[str, Any] = {}
                     try:
-                        args = json.loads(tool_call.function.arguments)
-                        if not isinstance(args, dict):
-                            parse_error = f"TOOL_ARGUMENT_ERROR: Expected JSON object for '{fname}', got {type(args).__name__}"
+                        parsed = json.loads(tool_call.function.arguments or "{}")
+                        if isinstance(parsed, dict):
+                            tool_args = parsed
+                            tool_error = None
+                        else:
+                            tool_error = f"TOOL_ARGUMENT_ERROR: Expected JSON object for '{fname}', got {type(parsed).__name__}"
                     except (json.JSONDecodeError, TypeError) as jde:
-                        parse_error = f"TOOL_ARGUMENT_ERROR: Malformed JSON arguments for tool '{fname}': {jde}"
+                        tool_error = f"TOOL_ARGUMENT_ERROR: Malformed JSON arguments for tool '{fname}': {jde}"
 
                     tool_payload = {"tool": fname, "subtask_id": node_id}
-                    if parse_error is None and fname == "run_command" and "command" in args:
-                        tool_payload["command"] = redact(str(args["command"]))
+                    if fname in ("read_file", "write_file", "apply_patch", "make_directory") and "path" in tool_args:
+                        tool_payload["path"] = str(tool_args["path"])
+                    if fname == "run_command" and "command" in tool_args:
+                        tool_payload["command"] = redact(str(tool_args["command"]))
                     log_event(task_id, "TOOL_STARTED", tool_payload)
 
-                    if parse_error is not None:
-                        result = parse_error
-                        execution_succeeded = False
+                    if tool_error is not None:
+                        result_text = tool_error
                     else:
                         func = TOOL_FUNCTIONS.get(fname)
-                        try:
-                            result = func(**args) if func else f"Unknown tool: {fname}"
-                        except (TypeError, ValueError, OSError) as e:
-                            result = f"Tool {fname} failed: {e}"
-                            execution_succeeded = False
+                        if func is None:
+                            result_text = f"Unknown tool: {fname}"
+                        else:
+                            try:
+                                result_text = str(func(**tool_args))
+                            except Exception as e:  # one bad tool call must not abort the task
+                                result_text = f"Tool {fname} failed: {type(e).__name__}: {e}"
 
-                    result_text = str(result)
-                    if result_text.startswith((
-                        "TOOL_ARGUMENT_ERROR",
-                        "Denied by security policy",
-                        "Could not apply",
-                        "Write refused",
-                        "Patch refused",
-                        "Command refused",
-                        "Tool ",
-                    )) or "[ISOLATION: DENIED" in result_text:
-                        execution_succeeded = False
-                    elif fname in ("write_file", "apply_patch", "run_command", "make_directory") and executor_mod._tool_result_failed(fname, result_text):
-                        execution_succeeded = False
+                    ok = not result_text.startswith(_TOOL_FAILURE_PREFIXES)
+                    if fname == "run_command" and executor_mod._tool_result_failed(fname, result_text):
+                        ok = False
+                    log_event(task_id, "TOOL_FINISHED", {**tool_payload, "ok": ok})
 
-                    log_event(task_id, "TOOL_FINISHED", {
-                        "tool": fname,
-                        "subtask_id": node_id,
-                        "ok": parse_error is None and not str(result).startswith("Tool ") and not str(result).startswith("TOOL_ARGUMENT_ERROR"),
-                    })
-
-                    # Track file changes for this node
-                    if fname == "apply_patch" and str(result).startswith("Patch applied:"):
-                        changed_path = args.get("path", "unknown")
-                        node_changes.append({"path": changed_path, "kind": "patch", "detail": args.get("diff", "")})
+                    if fname == "apply_patch" and result_text.startswith("Patch applied:"):
+                        changed_path = str(tool_args.get("path", "unknown"))
+                        node_changes.append({"path": changed_path, "kind": "patch", "detail": tool_args.get("diff", "")})
                         files_touched_set.add(changed_path)
-                        test_file_changed = test_file_changed or executor_mod._is_test_file_path(changed_path)
-                    elif fname == "write_file" and str(result).startswith("Written:"):
-                        changed_path = args.get("path", "unknown")
-                        node_changes.append({"path": changed_path, "kind": "new or rewritten file", "detail": args.get("content", "")})
+                        log_event(task_id, "FILE_EDITED", {"subtask_id": node_id, "path": changed_path, "kind": "patch"})
+                    elif fname == "write_file" and result_text.startswith("Written:"):
+                        changed_path = str(tool_args.get("path", "unknown"))
+                        node_changes.append({"path": changed_path, "kind": "new or rewritten file", "detail": tool_args.get("content", "")})
                         files_touched_set.add(changed_path)
-                        test_file_changed = test_file_changed or executor_mod._is_test_file_path(changed_path)
-                        try:
-                            full = (self.workspace / str(changed_path)).resolve()
-                            if str(full) in getattr(qz_tools, "_AGENT_CREATED_FILES", set()):
-                                agent_created_this_node.add(str(changed_path))
-                        except Exception:
-                            pass
+                        log_event(task_id, "FILE_EDITED", {"subtask_id": node_id, "path": changed_path, "kind": "write"})
 
-                    if fname == "run_command":
-                        cmd_str = str(args.get("command", "")).strip()
+                    if fname == "run_command" and tool_error is None:
+                        cmd_str = str(tool_args.get("command", "")).strip()
                         node_commands.append(cmd_str)
                         node_tests.append(cmd_str)
-                        iteration_failed = executor_mod._tool_result_failed(fname, str(result))
+                        last_command_output = result_text
+                        iteration_failed = executor_mod._tool_result_failed(fname, result_text)
                         if (
                             iteration_failed
                             and test_baseline
                             and cmd_str == test_baseline.command.strip()
-                            and executor_mod._test_failure_signature(str(result)) == test_baseline.signature
+                            and executor_mod._test_failure_signature(result_text) == test_baseline.signature
                         ):
                             iteration_failed = False
 
                     from qz_security.injection_guard import wrap_untrusted_content
-                    safe_content = wrap_untrusted_content(str(result), label=f"tool_result_{fname}")
                     messages.append({
                         "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": safe_content,
+                        "tool_call_id": getattr(tool_call, "id", None) or f"call_{iteration}",
+                        "content": wrap_untrusted_content(result_text, label=f"tool_result_{fname or 'unknown'}"),
                     })
 
                 if iteration_failed is True:
@@ -452,42 +428,31 @@ class HardDAGExecutor:
                     consecutive_failures = 0
 
                 if consecutive_failures >= 3 and not escalated:
-                    prev_model = active_model
-                    escalated_alias, _ = select_route("reasoner", task_id=task_id, requires_tools=True, requires_reasoning=True)
-                    active_model = escalated_alias
+                    active_model = executor_mod.ESCALATION_ROLE
                     escalated = True
                     consecutive_failures = 0
+                    log_event(task_id, "MODEL_ESCALATED", {"subtask_id": node_id, "role": active_model})
+
             if model_request_error is not None:
                 print(f"\033[91m[node {node_id}]\033[0m Execution aborted due to model error: {model_request_error}")
                 if attempt < self.max_node_retries:
                     attempt += 1
                     update_subtask_status(node_id, SubtaskStatus.RETRYING, attempts=attempt)
                     continue
-                else:
-                    update_subtask_status(
-                        node_id,
-                        SubtaskStatus.FAILED,
-                        attempts=attempt,
-                        result_summary=f"Model request failed: {model_request_error}",
-                    )
-                    return NodeResult(
-                        node_id=node_id,
-                        status=SubtaskStatus.FAILED,
-                        summary=f"Model request failed: {model_request_error}",
-                        files_changed=node_changes,
-                        commands_executed=node_commands,
-                        tests_run=node_tests,
-                        validation_result={"status": "FAIL", "error": model_request_error},
-                        duration=time.monotonic() - start_time,
-                        model_used=active_model,
-                        provider_id=provider_id,
-                        model_id=model_id,
-                        model_display_name=model_display_name,
-                        key_identity=key_identity,
-                        attempts=attempt,
-                    )
+                update_subtask_status(
+                    node_id,
+                    SubtaskStatus.FAILED,
+                    attempts=attempt,
+                    result_summary=f"Model request failed: {model_request_error}",
+                )
+                return result(
+                    SubtaskStatus.FAILED,
+                    f"Model request failed: {model_request_error}",
+                    validation_result={"status": "FAIL", "error": model_request_error},
+                    error=f"Model request failed: {model_request_error}",
+                )
 
-            # Validation Gate for this node
+            # Validation gate for this node
             _persist_task(task_id, lambda: update_status(task_id, TaskStatus.VALIDATING, current_step=f"validating node {node_id}"))
             val_report = self.val_pipeline.run(
                 task_id=task_id,
@@ -495,11 +460,10 @@ class HardDAGExecutor:
                 requirements_text=f"{overall_task}\n{node_title}\n{node_desc}",
                 changes=node_changes,
                 client=self.client,
+                test_baseline=test_baseline,
             )
 
-            if val_report.passed and execution_succeeded and not getattr(val_report, "skipped_required_checks", []):
-                # Validation passed and execution succeeded -> Node is complete
-                # Commit checkpoint strictly for files touched by this node
+            if val_report.passed:
                 touched_list = sorted(files_touched_set)
                 commit_hash = None
                 if touched_list:
@@ -508,6 +472,9 @@ class HardDAGExecutor:
                     if commit_res.startswith("Git commit created:"):
                         commit_hash = _commit_hash_from_result(commit_res)
                         create_checkpoint(task_id, attempt, git_commit_hash=commit_hash, summary=commit_msg)
+                    else:
+                        print(f"\033[93m[node {node_id}]\033[0m {commit_res}")
+                qz_tools.begin_change_tracking()
 
                 summary_text = last_turn_response.strip() or f"Node '{node_title}' completed successfully."
                 update_subtask_status(
@@ -517,79 +484,51 @@ class HardDAGExecutor:
                     files_touched=touched_list,
                     attempts=attempt,
                 )
-
-                log_event(task_id, "NODE_COMPLETED", {
+                completion_payload = {
                     "subtask_id": node_id,
                     "title": node_title,
                     "summary": summary_text,
                     "files_touched": touched_list,
                     "commit_hash": commit_hash,
                     "attempts": attempt,
-                })
-                log_event(task_id, "SUBTASK_COMPLETED", {
-                    "subtask_id": node_id,
-                    "title": node_title,
-                    "summary": summary_text,
-                    "files_touched": touched_list,
-                    "attempts": attempt,
-                })
-                log_event(task_id, "dag.node.completed", {
-                    "subtask_id": node_id,
-                    "title": node_title,
-                    "summary": summary_text,
-                })
+                }
+                log_event(task_id, "NODE_COMPLETED", completion_payload)
+                log_event(task_id, "SUBTASK_COMPLETED", completion_payload)
+                log_event(task_id, "dag.node.completed", {"subtask_id": node_id, "title": node_title, "summary": summary_text})
+                return result(SubtaskStatus.COMPLETED, summary_text, validation_result=val_report.to_dict())
 
-                return NodeResult(
-                    node_id=node_id,
-                    status=SubtaskStatus.COMPLETED,
-                    summary=summary_text,
-                    files_changed=node_changes,
-                    commands_executed=node_commands,
-                    tests_run=node_tests,
-                    validation_result=val_report.to_dict(),
-                    duration=time.monotonic() - start_time,
-                    model_used=active_model,
-                    provider_id=provider_id,
-                    model_id=model_id,
-                    model_display_name=model_display_name,
-                    key_identity=key_identity,
-                    attempts=attempt,
-                )
-
-            # Node validation failed -> repair loop if retries remain
+            # Validation failed -> repair loop if retries remain
             print(f"\033[93m[node {node_id}]\033[0m Validation failed on attempt {attempt}/{self.max_node_retries}:\n{val_report.summary}")
             if attempt < self.max_node_retries:
                 attempt += 1
                 update_subtask_status(node_id, SubtaskStatus.RETRYING, attempts=attempt)
-
-                repair_prompt = f"Validation checks for this node failed:\n{val_report.summary}\n\nDiagnose the cause, apply fixes to the code/tests for this node, and rerun tests."
+                repair_prompt = (
+                    f"Validation checks for this node failed:\n{val_report.summary}\n\n"
+                    "Diagnose the cause, apply fixes to the code/tests for this node, and rerun tests."
+                )
                 try:
                     from qz_repair import classify_failure
-                    classified = classify_failure(val_report, raw_command_output=node_commands[-1] if node_commands else None)
+                    classified = classify_failure(val_report, raw_command_output=last_command_output)
                     current_diff = "\n".join(str(c.get("detail", "")) for c in node_changes)
                     anti_loop = repair_history.get_anti_loop_feedback(classified.diagnostics.error_signature, current_diff=current_diff) if repair_history else ""
                     repair_prompt = classified.format_for_repair_prompt(attempt, self.max_node_retries, history_feedback=anti_loop)
                     if repair_history:
                         repair_history.record_attempt(attempt, classified.category, classified.diagnostics.error_signature, diff_text=current_diff)
-                    
-                    # Rollback touched files if a repeated loop is detected or on catastrophic build failure
-                    if anti_loop or (classified and classified.category.value == "build_failure"):
-                        touched_files = [f for f in files_touched_set if f and f != "unknown"]
-                        if touched_files:
-                            try:
-                                import subprocess
-                                from qz_sandbox.backend import sanitize_subprocess_env
-                                subprocess.run(
-                                    ["git", "checkout", "HEAD", "--"] + touched_files,
-                                    cwd=str(self.workspace),
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=10.0,
-                                    env=sanitize_subprocess_env(str(self.workspace)),
-                                )
-                                repair_prompt += f"\n\n[System Safety Rollback]: Touched files ({', '.join(touched_files)}) have been reset to the clean checkpoint baseline to avoid compounding bad edits. Please start fresh."
-                            except Exception:
-                                pass
+
+                    # When the agent is looping on the same failure, undo only the
+                    # edits it made in this node (never the user's own changes).
+                    if anti_loop or classified.category.value == "build_failure":
+                        restored, skipped = qz_tools.restore_tracked_changes()
+                        if restored:
+                            files_touched_set.difference_update(restored)
+                            node_changes = [c for c in node_changes if str(c.get("path")) not in restored]
+                            repair_prompt += (
+                                f"\n\n[System Safety Rollback]: Your edits to {', '.join(restored)} were reverted to "
+                                "their state before this node to avoid compounding bad edits. Please start fresh."
+                            )
+                        if skipped:
+                            repair_prompt += f"\n(Not reverted because they changed outside the agent: {', '.join(skipped)})"
+                        log_event(task_id, "NODE_CHANGES_REVERTED", {"subtask_id": node_id, "restored": restored, "skipped": skipped})
 
                     log_event(task_id, "REPAIR_ATTEMPT", {
                         "subtask_id": node_id,
@@ -597,8 +536,8 @@ class HardDAGExecutor:
                         "category": classified.category.value,
                         "failing_check": classified.check_name,
                     })
-                except Exception:
-                    pass
+                except Exception as error:
+                    log_event(task_id, "REPAIR_CLASSIFICATION_FAILED", {"subtask_id": node_id, "error": str(error)})
 
                 log_event(task_id, "NODE_RETRYING", {
                     "subtask_id": node_id,
@@ -606,18 +545,14 @@ class HardDAGExecutor:
                     "attempt": attempt,
                     "failing_checks": val_report.failed_required_checks,
                 })
-                log_event(task_id, "dag.node.retrying", {
-                    "subtask_id": node_id,
-                    "attempt": attempt,
-                })
-                messages.append({
-                    "role": "user",
-                    "content": repair_prompt,
-                })
+                log_event(task_id, "dag.node.retrying", {"subtask_id": node_id, "attempt": attempt})
+                messages.append({"role": "user", "content": repair_prompt})
                 continue
 
-            # Retries exhausted -> Node permanently failed
-            failing_reasons = getattr(val_report, "failed_required_checks", []) or (["unverified required checks"] if getattr(val_report, "skipped_required_checks", []) else ["execution errors encountered"])
+            # Retries exhausted -> node failed
+            failing_reasons = val_report.failed_required_checks or (
+                ["unverified required checks"] if val_report.skipped_required_checks else ["validation did not pass"]
+            )
             error_summary = f"Validation failed after {attempt} attempt(s): {', '.join(failing_reasons)}"
             update_subtask_status(
                 node_id,
@@ -626,49 +561,18 @@ class HardDAGExecutor:
                 files_touched=sorted(files_touched_set),
                 attempts=attempt,
             )
-            log_event(task_id, "NODE_FAILED", {
-                "subtask_id": node_id,
-                "title": node_title,
-                "error": error_summary,
-                "attempts": attempt,
-            })
-            log_event(task_id, "SUBTASK_FAILED", {
-                "subtask_id": node_id,
-                "title": node_title,
-                "error": error_summary,
-                "attempts": attempt,
-            })
-            log_event(task_id, "dag.node.failed", {
-                "subtask_id": node_id,
-                "title": node_title,
-                "error": error_summary,
-            })
-
-            return NodeResult(
-                node_id=node_id,
-                status=SubtaskStatus.FAILED,
-                summary=f"Failed: {error_summary}",
-                files_changed=node_changes,
-                commands_executed=node_commands,
-                tests_run=node_tests,
+            failure_payload = {"subtask_id": node_id, "title": node_title, "error": error_summary, "attempts": attempt}
+            log_event(task_id, "NODE_FAILED", failure_payload)
+            log_event(task_id, "SUBTASK_FAILED", failure_payload)
+            log_event(task_id, "dag.node.failed", {"subtask_id": node_id, "title": node_title, "error": error_summary})
+            return result(
+                SubtaskStatus.FAILED,
+                f"Failed: {error_summary}",
                 validation_result=val_report.to_dict(),
                 error=error_summary,
-                duration=time.monotonic() - start_time,
-                model_used=active_model,
-                provider_id=provider_id,
-                model_id=model_id,
-                model_display_name=model_display_name,
-                key_identity=key_identity,
-                attempts=attempt,
             )
 
-        return NodeResult(
-            node_id=node_id,
-            status=SubtaskStatus.FAILED,
-            error="Node retry loop completed without passing validation",
-            duration=time.monotonic() - start_time,
-            attempts=attempt,
-        )
+        return result(SubtaskStatus.FAILED, "", error="Node retry loop completed without passing validation")
 
     def execute_dag(
         self,
@@ -686,6 +590,7 @@ class HardDAGExecutor:
         # corresponding `tasks` row yet persisted. Subtask rows have a FK dependency on
         # tasks.id, so guarantee the parent row exists before anything else touches the DB.
         ensure_task(task_id, task_text, str(self.workspace))
+        qz_tools.reset_task_state()
 
         all_subtasks = get_subtasks(task_id)
 

@@ -1,9 +1,10 @@
-"""Phase 12 — desktop backend: first-run setup, config generation, provider/model management,
-and automatic LiteLLM proxy lifecycle.
+"""Desktop backend: key management, provider/model configuration and status.
 
-This module is deliberately UI-free. It is the backend half of Phase 12 —
-everything a desktop UI would call into — exposed as a plain Python API, plus a small CLI
-(`qazterion-setup`) so the same behavior can be used and verified directly.
+UI-free Python API used by the desktop bridge (and the ``qazterion-setup`` CLI).
+Model calls go straight from the agent to providers through the in-process
+gateway, so there is no proxy process to start, stop or keep healthy; the
+``start``/``stop``/``apply_and_start`` methods remain for UI compatibility and
+simply reload configuration and report status.
 """
 
 from __future__ import annotations
@@ -11,18 +12,14 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
-import secrets
 import sys
-from pathlib import Path
+from typing import Any
 
-import yaml
-
-import generate_config
 from qz_keystore import KeyStore, SUPPORTED_PROVIDERS, mask_key
-from qz_proxy_manager import ProxyManager
-from qz_usage_tracker import UsageTracker, default_usage_log_path
-
-DEFAULT_CONFIG_PATH = "config.yaml"
+from qz_paths import load_environment
+from qz_providers.catalog import CatalogError, ProviderCatalog
+from qz_providers.gateway import ModelGateway, get_gateway
+from qz_usage_tracker import UsageTracker, get_usage_tracker
 
 
 class SetupError(RuntimeError):
@@ -33,483 +30,310 @@ class DesktopBackend:
     def __init__(
         self,
         keystore: KeyStore | None = None,
-        proxy_manager: ProxyManager | None = None,
         usage_tracker: UsageTracker | None = None,
-        config_path: str | Path = DEFAULT_CONFIG_PATH,
-        stop_proxy_on_exit: bool = True,
+        gateway: ModelGateway | None = None,
+        **_legacy: Any,
     ) -> None:
-        self.config_path = Path(config_path)
+        load_environment()
         self.keystore = keystore or KeyStore()
-        self.proxy_manager = proxy_manager or ProxyManager(config_path=self.config_path)
-        self.usage_tracker = usage_tracker or UsageTracker(log_path=default_usage_log_path())
-        self.stop_proxy_on_exit = stop_proxy_on_exit
-        self._hydrate_runtime_providers()
+        self.usage_tracker = usage_tracker or get_usage_tracker()
+        self.gateway = gateway or get_gateway()
 
-    def _hydrate_runtime_providers(self) -> None:
-        """Restore user-added providers into the in-memory registry after a restart."""
-        try:
-            from qz_providers.registry import get_provider_registry
-            registry = get_provider_registry()
-            for custom in self.keystore.list_custom_providers():
-                registry.register_provider(
-                    custom["provider_id"],
-                    display_name=custom.get("display_name"),
-                    base_url=custom.get("base_url"),
-                    enabled=True,
-                )
-            known = {p.provider_id for p in registry.list_providers()}
-            for entry in self.keystore.list_entries():
-                if entry.provider not in known:
-                    meta = self.keystore.get_custom_provider(entry.provider) or {}
-                    registry.register_provider(
-                        entry.provider,
-                        display_name=meta.get("display_name"),
-                        base_url=meta.get("base_url"),
-                        enabled=True,
-                    )
-                    known.add(entry.provider)
-        except Exception:
-            pass
+    @property
+    def catalog(self) -> ProviderCatalog:
+        return self.gateway.catalog
 
-    # ---- first-run setup ----------------------------------------------------
+    def _keys_changed(self, key_id: str | None = None) -> None:
+        self.gateway.keys.invalidate()
+        if key_id:
+            self.gateway.health.reset_key(key_id)
 
-    def first_run_setup(
-        self,
-        keys: dict[str, list[str]] | None = None,
-        master_key: str | None = None,
-        interactive: bool = False,
-    ) -> dict:
-        """Store the given keys (e.g. ``{"groq": ["k1", "k2"]}``) and the
-        LiteLLM master key. When ``interactive`` is True and ``keys`` is
-        None, prompt on stdin for every supported provider instead. A
-        missing master key is generated automatically (never left unset)
-        unless one is already stored."""
+    # ---- keys -------------------------------------------------------------------
+
+    def first_run_setup(self, keys: dict[str, list[str]] | None = None, master_key: str | None = None,
+                        interactive: bool = False) -> dict:
+        """Store keys, e.g. ``{"groq": ["k1", "k2"], "gemini": ["k3"]}``.
+
+        New keys are appended after the provider's existing ones; a key that is
+        already stored is not duplicated. ``master_key`` is ignored (no proxy).
+        """
+        del master_key
         if keys is None:
             keys = self._prompt_for_keys() if interactive else {}
-
         configured: dict[str, int] = {}
         for provider, values in keys.items():
-            usable = [value.strip() for value in values if value and value.strip()]
-            for position, value in enumerate(usable, start=1):
-                self.keystore.set_key(provider, position, value, enabled=True)
-            if usable:
-                configured[provider.lower()] = len(usable)
-
-        if master_key and master_key.strip():
-            self.keystore.set_master_key(master_key.strip())
-        elif interactive and keys is not None and not self.keystore.has_master_key():
-            entered = getpass.getpass("LiteLLM master key (blank to auto-generate): ")
-            self.keystore.set_master_key(entered.strip() or secrets.token_urlsafe(32))
-        elif not self.keystore.has_master_key():
-            self.keystore.set_master_key(secrets.token_urlsafe(32))
-
+            pid = provider.lower().strip()
+            existing = self.keystore.list_entries(provider=pid)
+            used = {e.index for e in existing}
+            known = {e.masked_value for e in existing}
+            added = 0
+            for value in (v.strip() for v in values if v and v.strip()):
+                if mask_key(value) in known and any(self.keystore.get_key(pid, e.index) == value for e in existing):
+                    continue
+                index = 1
+                while index in used:
+                    index += 1
+                env_name = self.keystore.set_key(pid, index, value, enabled=True)
+                self._keys_changed(env_name)
+                used.add(index)
+                added += 1
+            if added or existing:
+                configured[pid] = len(existing) + added
         return {
             "backend": self.keystore.backend_name(),
             "configured_providers": configured,
-            "unconfigured_providers": [p for p in SUPPORTED_PROVIDERS if p not in configured],
-            "master_key_set": self.keystore.has_master_key(),
+            "unconfigured_providers": [p for p in self.catalog.providers if p not in configured],
+            "master_key_set": True,
         }
 
     def _prompt_for_keys(self) -> dict[str, list[str]]:
-        print("Qazterion first-run setup — enter API keys for each provider.")
-        print("Leave blank and press Enter to skip a provider. Multiple keys: comma-separated.\n")
+        print("Qazterion setup - enter API keys per provider (comma-separate several keys; blank skips).")
         collected: dict[str, list[str]] = {}
-        for provider in SUPPORTED_PROVIDERS:
+        for provider in self.catalog.providers:
             entered = getpass.getpass(f"{provider} key(s): ")
             if entered.strip():
                 collected[provider] = [part.strip() for part in entered.split(",")]
         return collected
 
-    # ---- configuration generation -----------------------------------------
-
-    def generate_configuration(self) -> dict:
-        """Regenerate `config.yaml`'s `model_list` from enabled keystore keys."""
-        if not self.config_path.is_file():
-            raise SetupError(f"Config template not found: {self.config_path}")
-        with self.config_path.open(encoding="utf-8") as source:
-            config = yaml.safe_load(source) or {}
-        model_list = config.get("model_list")
-        if not isinstance(model_list, list):
-            raise SetupError(f"{self.config_path} must contain a model_list array.")
-
-        groups = self.keystore.enabled_key_groups()
-        expanded, untemplated = generate_config.expand_model_list(model_list, groups)
-
-        warnings = [f"No model template for discovered keys: {family}" for family in sorted(untemplated)]
-        custom_by_family = {
-            str(meta.get("family") or f"{meta['provider_id'].upper()}_KEY"): meta
-            for meta in self.keystore.list_custom_providers()
-        }
-        for family in sorted(untemplated):
-            keys = groups.get(family) or []
-            meta = custom_by_family.get(family, {})
-            provider_id = str(meta.get("provider_id") or family.replace("_KEY", "").lower())
-            default_model = str(meta.get("default_model") or "gpt-4o-mini")
-            api_base = meta.get("base_url")
-            for key_name in keys:
-                params = {
-                    "model": f"openai/{default_model}",
-                    "api_key": f"os.environ/{key_name}",
-                }
-                if api_base:
-                    params["api_base"] = api_base
-                expanded.append({
-                    "model_name": f"{provider_id}-default",
-                    "litellm_params": params,
-                })
-            warnings = [w for w in warnings if family not in w]
-        enabled_env_names = {name for names in groups.values() for name in names}
-        kept = []
-        for entry in expanded:
-            api_key_ref = entry.get("litellm_params", {}).get("api_key", "")
-            if api_key_ref.startswith("os.environ/"):
-                env_name = api_key_ref.removeprefix("os.environ/")
-                if env_name not in enabled_env_names:
-                    warnings.append(
-                        f"No enabled key for {env_name} — alias '{entry.get('model_name')}' "
-                        f"was left out of config.yaml until a key is added and enabled."
-                    )
-                    continue
-            kept.append(entry)
-
-        config["model_list"] = kept
-        with self.config_path.open("w", encoding="utf-8", newline="\n") as target:
-            yaml.safe_dump(config, target, allow_unicode=True, sort_keys=False, default_flow_style=False)
-
-        return {
-            "model_entries": len(kept),
-            "configured_families": sorted(groups),
-            "warnings": sorted(set(warnings)),
-        }
-
-    def validate_configuration(self) -> dict:
-        if not self.config_path.is_file():
-            return {"valid": False, "errors": [f"Config file not found: {self.config_path}"]}
-        try:
-            with self.config_path.open(encoding="utf-8") as source:
-                config = yaml.safe_load(source) or {}
-        except yaml.YAMLError as error:
-            return {"valid": False, "errors": [f"Invalid YAML: {error}"]}
-        errors = []
-        if not isinstance(config.get("model_list"), list) or not config["model_list"]:
-            errors.append("model_list is missing or empty.")
-        if not self.keystore.has_master_key():
-            errors.append("No LiteLLM master key is configured.")
-        return {"valid": not errors, "errors": errors}
-
-    def set_routing_strategy(self, strategy: str) -> dict:
-        """Persist a UI-selected LiteLLM routing strategy in the real config."""
-        allowed = {"least-busy", "lowest-cost", "simple-shuffle"}
-        if strategy not in allowed:
-            raise SetupError(f"Unsupported routing strategy: {strategy}")
-        with self.config_path.open(encoding="utf-8") as source:
-            config = yaml.safe_load(source) or {}
-        router = config.setdefault("router_settings", {})
-        if not isinstance(router, dict):
-            raise SetupError("router_settings must be an object.")
-        router["routing_strategy"] = strategy
-        with self.config_path.open("w", encoding="utf-8", newline="\n") as target:
-            yaml.safe_dump(config, target, allow_unicode=True, sort_keys=False, default_flow_style=False)
-        return {"strategy": strategy}
-
-    # ---- proxy lifecycle ----------------------------------------------------
-
-    def apply_and_start(self, wait_for_health: float = 0.0) -> dict:
-        """Regenerate configuration, validate it, then (re)start the proxy
-        with exactly the environment variables it needs.
-
-        Default wait_for_health is 0: spawn the proxy and return immediately
-        so the desktop RPC loop is not blocked while LiteLLM boots.
-        """
-        generation = self.generate_configuration()
-        validation = self.validate_configuration()
-        if not validation["valid"]:
-            raise SetupError("Configuration is invalid: " + "; ".join(validation["errors"]))
-        proxy_status = self.proxy_manager.restart(
-            env_overrides=self.keystore.enabled_env(), wait_for_health=wait_for_health
-        ).to_dict()
-        return {"generation": generation, "validation": validation, "proxy": proxy_status}
-
-    def start(self, wait_for_health: float = 15.0) -> dict:
-        return self.proxy_manager.start(
-            env_overrides=self.keystore.enabled_env(), wait_for_health=wait_for_health
-        ).to_dict()
-
-    def stop(self) -> dict:
-        return self.proxy_manager.stop().to_dict()
-
-    def shutdown(self) -> None:
-        if self.stop_proxy_on_exit:
-            self.proxy_manager.stop()
-
-    # ---- status for UI ------------------------------------------------------
-
-    def _aliases_and_fallbacks(self) -> dict:
-        if not self.config_path.is_file():
-            return {"aliases": [], "fallback_order": {}}
-        try:
-            config = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
-        except yaml.YAMLError:
-            return {"aliases": [], "fallback_order": {}}
-        aliases = sorted({entry.get("model_name") for entry in config.get("model_list", []) if isinstance(entry, dict)})
-        fallback_order = {}
-        for item in (config.get("router_settings") or {}).get("fallbacks", []) or []:
-            if isinstance(item, dict):
-                fallback_order.update(item)
-        return {"aliases": aliases, "fallback_order": fallback_order}
-
-    def status(self) -> dict:
-        proxy_status = self.proxy_manager.status().to_dict()
-        config_info = self._aliases_and_fallbacks()
-        return {
-            "proxy": proxy_status,
-            "configured_providers": [
-                {"provider": e.provider, "env_name": e.env_name, "masked_value": e.masked_value, "enabled": e.enabled}
-                for e in self.keystore.list_entries()
-            ],
-            "master_key_set": self.keystore.has_master_key(),
-            "keystore_backend": self.keystore.backend_name(),
-            "aliases": config_info["aliases"],
-            "fallback_order": config_info["fallback_order"],
-            "usage": self.usage_tracker.summary(),
-            "last_error": proxy_status["last_error"],
-        }
-
-    # ---- Phase 12: Provider & Model Management ------------------------------
-
-    def get_providers(self) -> list[dict]:
-        """Return all registered providers with enablement, adapter info, and key counts."""
-        from qz_providers.registry import get_provider_registry
-        reg = get_provider_registry()
-        entries = self.keystore.list_entries()
-        key_counts: dict[str, int] = {}
-        for e in entries:
-            if e.enabled and e.masked_value != "(not set)":
-                key_counts[e.provider] = key_counts.get(e.provider, 0) + 1
-
-        results = []
-        seen: set[str] = set()
-        custom_meta = {m["provider_id"]: m for m in self.keystore.list_custom_providers()}
-        for p in reg.list_providers():
-            p_dict = p.to_dict()
-            extra = custom_meta.get(p.provider_id, {})
-            k_count = key_counts.get(p.provider_id, 0)
-            p_dict["key_count"] = k_count
-            p_dict["configured"] = bool(k_count > 0)
-            p_dict["custom"] = p.provider_id in custom_meta
-            if extra.get("default_model"):
-                p_dict["default_model"] = extra["default_model"]
-            if extra.get("base_url") and not p_dict.get("base_url"):
-                p_dict["base_url"] = extra["base_url"]
-            results.append(p_dict)
-            seen.add(p.provider_id)
-        for meta in custom_meta.values():
-            if meta["provider_id"] in seen:
-                continue
-            k_count = key_counts.get(meta["provider_id"], 0)
-            results.append({
-                "provider_id": meta["provider_id"],
-                "display_name": meta.get("display_name") or meta["provider_id"],
-                "enabled": True,
-                "adapter_type": "OpenAICompatibleAdapter",
-                "base_url": meta.get("base_url"),
-                "default_concurrency": 2,
-                "supported_capabilities": ["chat", "streaming", "tool_calling"],
-                "models": [meta["default_model"]] if meta.get("default_model") else [],
-                "key_count": k_count,
-                "configured": bool(k_count > 0),
-                "custom": True,
-                "default_model": meta.get("default_model"),
-            })
-        return results
-
-    def set_provider_enabled(self, provider: str, enabled: bool) -> dict:
-        """Enable or disable a provider in ProviderRegistry."""
-        from qz_providers.registry import get_provider_registry
-        reg = get_provider_registry()
-        if enabled:
-            reg.enable_provider(provider)
-        else:
-            reg.disable_provider(provider)
-        return {"provider": provider.lower(), "enabled": enabled}
-
-    def get_models(self, provider: str | None = None) -> list[dict]:
-        """Return rich metadata for all models in ModelRegistry."""
-        from qz_providers.model_registry import get_model_registry
-        from qz_providers.registry import get_provider_registry
-        reg = get_model_registry()
-        prov_reg = get_provider_registry()
-        entries = self.keystore.list_entries()
-        configured_providers = {e.provider.lower() for e in entries if e.enabled and e.masked_value != "(not set)"}
-        models = reg.list_models(provider=provider, include_historical=True)
-        results = []
-        for m in models:
-            m_dict = m.to_dict()
-            prov_id = m.provider.lower()
-            is_conf = prov_id in configured_providers
-            m_dict["is_configured"] = is_conf
-            if not is_conf:
-                m_dict["state"] = "unconfigured"
-            results.append(m_dict)
-        return results
-
-    def refresh_models(self, provider: str | None = None, per_provider_timeout: float = 10.0) -> dict:
-        """Trigger dynamic model discovery from providers using keystore credentials.
-
-        Runs each provider's discovery concurrently and caps how long any one
-        provider can take. Previously this looped over every enabled
-        provider one at a time with a 10s network timeout each, so a single
-        slow/unreachable provider could hold up "Discover Models" (and, on
-        the old synchronous RPC loop, the entire app) for up to ~50s. Now
-        the worst case for the whole call is bounded by
-        `per_provider_timeout`, not `len(providers) * per_provider_timeout`.
-        """
-        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-        from qz_providers.model_registry import get_model_registry
-        from qz_providers.registry import get_provider_registry
-        model_reg = get_model_registry()
-        prov_reg = get_provider_registry()
-
-        providers_to_refresh = [provider.lower()] if provider else [p.provider_id for p in prov_reg.list_providers(enabled_only=True)]
-        discovered_summary: dict[str, int] = {}
-        errors: dict[str, str] = {}
-
-        runnable: dict[str, str] = {}
-        for p_id in providers_to_refresh:
-            key_val = self.keystore.get_key(p_id, 1)
-            if not key_val or not key_val.strip():
-                # Skip unconfigured providers to avoid network timeout hangs
-                continue
-            runnable[p_id] = key_val
-
-        if runnable:
-            with ThreadPoolExecutor(max_workers=min(8, len(runnable)), thread_name_prefix="qz-discover") as pool:
-                futures = {
-                    pool.submit(model_reg.discover_models_for_provider, p_id, api_key=key_val): p_id
-                    for p_id, key_val in runnable.items()
-                }
-                for future, p_id in futures.items():
-                    try:
-                        discovered = future.result(timeout=per_provider_timeout)
-                        discovered_summary[p_id] = len(discovered)
-                    except FutureTimeoutError:
-                        errors[p_id] = f"Discovery timed out after {per_provider_timeout:.0f}s."
-                    except Exception as error:
-                        errors[p_id] = str(error)
-
-        result = {"refreshed": discovered_summary, "total_models": len(model_reg.list_models())}
-        if errors:
-            result["errors"] = errors
-        return result
-    
-    def set_preferred_model(self, alias: str, provider: str, model_id: str) -> dict:
-        """Update preferred model alias mapping."""
-        from qz_providers.model_registry import get_model_registry
-        get_model_registry().register_alias(alias, provider, model_id)
-        return {"alias": alias, "provider": provider, "model_id": model_id}
-
     def add_provider_key(self, provider: str, index: int, value: str, enabled: bool = True) -> dict:
-        """Add or update an API key in the keystore."""
         env_name = self.keystore.set_key(provider, index, value, enabled=enabled)
-        try:
-            from qz_pool import get_pool
-            get_pool().registry.reload()
-        except Exception:
-            pass
+        self._keys_changed(env_name)
         return {"provider": provider.lower(), "index": index, "env_name": env_name, "masked_value": mask_key(value)}
 
-    def register_custom_provider(
-        self,
-        provider: str,
-        value: str,
-        display_name: str | None = None,
-        base_url: str | None = None,
-        default_model: str | None = None,
-        index: int = 1,
-        enabled: bool = True,
-    ) -> dict:
-        """Register a newly released / OpenAI-compatible provider and store its key."""
-        meta = self.keystore.upsert_custom_provider(
-            provider,
-            display_name=display_name,
-            base_url=base_url,
-            default_model=default_model,
-        )
-        try:
-            from qz_providers.registry import get_provider_registry
-            get_provider_registry().register_provider(
-                meta["provider_id"],
-                display_name=meta.get("display_name"),
-                base_url=meta.get("base_url"),
-                enabled=True,
-            )
-        except Exception:
-            pass
-        key_info = self.add_provider_key(meta["provider_id"], index, value, enabled=enabled)
-        try:
-            from qz_providers.model_registry import get_model_registry
-            from qz_providers.models import ModelMetadata
-            model_id = str(meta.get("default_model") or "gpt-4o-mini")
-            get_model_registry().register_model(
-                ModelMetadata(
-                    provider=meta["provider_id"],
-                    model_id=model_id,
-                    display_name=model_id,
-                    capabilities=["chat", "streaming", "tool_calling"],
-                    source="user_config",
-                )
-            )
-        except Exception:
-            pass
-        generation = None
-        try:
-            generation = self.generate_configuration()
-        except Exception as error:
-            generation = {"warnings": [str(error)]}
-        return {**key_info, "display_name": meta.get("display_name"), "base_url": meta.get("base_url"), "default_model": meta.get("default_model"), "generation": generation}
-
     def delete_provider_key(self, provider: str, index: int) -> dict:
-        """Delete an API key from the keystore."""
         removed = self.keystore.delete_key(provider, index)
-        try:
-            from qz_pool import get_pool
-            get_pool().registry.reload()
-        except Exception:
-            pass
+        self._keys_changed()
         return {"provider": provider.lower(), "index": index, "removed": removed}
 
     def set_key_enabled(self, provider: str, index: int, enabled: bool) -> dict:
-        """Set enabled status of an API key in the keystore."""
         self.keystore.set_enabled(provider, index, enabled)
-        try:
-            from qz_pool import get_pool
-            get_pool().registry.reload()
-        except Exception:
-            pass
+        env_name = f"{self.keystore._family_for(provider)}_{index}"
+        # Re-enabling is an explicit "try this key again", so forget past failures.
+        self._keys_changed(env_name if enabled else None)
         return {"provider": provider.lower(), "index": index, "enabled": enabled}
 
-    def test_key(self, provider: str, value: str, base_url: str | None = None) -> dict:
-        """Test validity and connectivity of an API key against the provider."""
-        from qz_providers.connectivity import test_provider_connectivity
-        res = test_provider_connectivity(provider, value, base_url=base_url)
-        return res.to_dict()
+    def register_custom_provider(self, provider: str, value: str, display_name: str | None = None,
+                                 base_url: str | None = None, default_model: str | None = None,
+                                 index: int = 1, enabled: bool = True) -> dict:
+        """Add an OpenAI-compatible provider (base URL + model) and store its key."""
+        try:
+            spec = self.catalog.upsert_custom_provider(
+                provider, base_url=base_url or "", display_name=display_name, default_model=default_model,
+            )
+        except CatalogError as error:
+            raise SetupError(str(error)) from error
+        self.keystore.upsert_custom_provider(
+            spec.provider_id, display_name=spec.display_name, base_url=spec.base_url,
+            default_model=default_model, family=spec.key_prefix,
+        )
+        key_info = self.add_provider_key(spec.provider_id, index, value, enabled=enabled)
+        self.gateway.reload()
+        return {**key_info, "display_name": spec.display_name, "base_url": spec.base_url,
+                "default_model": default_model, "generation": self.generate_configuration()}
 
-    def check_health(self, workspace: str | Path | None = None) -> dict:
-        """Run a non-destructive runtime health audit."""
+    def test_key(self, provider: str, value: str, base_url: str | None = None) -> dict:
+        from qz_providers.connectivity import test_provider_connectivity
+
+        return test_provider_connectivity(provider, value, base_url=base_url, catalog=self.catalog).to_dict()
+
+    # ---- configuration --------------------------------------------------------
+
+    def generate_configuration(self) -> dict:
+        """Summarize which roles can be served by the configured keys (no files are written)."""
+        status = self.gateway.status()
+        warnings = [
+            f"Role '{role}' has no usable model: " + "; ".join(info["skipped"][:3])
+            for role, info in status["roles"].items() if not info["usable"]
+        ]
+        return {
+            "model_entries": sum(len(info["usable"]) for info in status["roles"].values()),
+            "configured_families": sorted(p["provider_id"] for p in status["providers"] if p["key_count"]),
+            "warnings": warnings,
+        }
+
+    def validate_configuration(self) -> dict:
+        errors: list[str] = []
+        try:
+            self.catalog.reload()
+        except CatalogError as error:
+            errors.append(str(error))
+        else:
+            status = self.gateway.status()
+            if not any(p["key_count"] for p in status["providers"]):
+                errors.append("No API key is configured for any provider.")
+            elif not status["roles"].get("coder", {}).get("usable"):
+                errors.append("No configured provider can serve the 'coder' role.")
+        return {"valid": not errors, "errors": errors}
+
+    def set_routing_strategy(self, strategy: str) -> dict:
+        """Persist the key strategy. Echoes the requested name (as older UIs expect)
+        and reports the effective Qazterion strategy separately."""
+        try:
+            normalized = self.catalog.set_key_strategy(strategy)
+        except CatalogError as error:
+            raise SetupError(str(error)) from error
+        return {"strategy": strategy, "effective_strategy": normalized}
+
+    # ---- "proxy" lifecycle (compatibility: there is no proxy any more) -------
+
+    def _connection_status(self) -> dict:
+        status = self.gateway.status()
+        usable = any(p["usable_keys"] for p in status["providers"] if p["enabled"])
+        return {
+            "running": True,
+            "healthy": usable,
+            "state": "direct" if usable else "no_keys",
+            "pid": None,
+            "crashed": False,
+            "last_error": None if usable else "No usable API key. Add a provider key to start.",
+        }
+
+    def apply_and_start(self, wait_for_health: float = 0.0) -> dict:
+        del wait_for_health
+        self.gateway.reload()
+        return {"generation": self.generate_configuration(), "validation": self.validate_configuration(),
+                "proxy": self._connection_status()}
+
+    def start(self, wait_for_health: float = 0.0) -> dict:
+        del wait_for_health
+        self.gateway.reload()
+        return self._connection_status()
+
+    def stop(self) -> dict:
+        return self._connection_status()
+
+    def shutdown(self) -> None:
+        self.gateway.close()
+
+    # ---- status for UI ------------------------------------------------------------
+
+    def status(self) -> dict:
+        gateway_status = self.gateway.status()
+        return {
+            "proxy": self._connection_status(),
+            "configured_providers": [
+                {"provider": k["provider"], "env_name": k["key_id"], "masked_value": k["masked_value"], "enabled": k["enabled"]}
+                for p in gateway_status["providers"] for k in p["keys"]
+            ],
+            "master_key_set": True,
+            "keystore_backend": self.keystore.backend_name(),
+            "aliases": sorted(self.catalog.roles),
+            "fallback_order": {role: list(refs) for role, refs in self.catalog.roles.items()},
+            "routing": gateway_status,
+            "usage": self.usage_tracker.summary(),
+            "last_error": None,
+        }
+
+    def get_providers(self) -> list[dict]:
+        rows = []
+        for provider in self.gateway.status()["providers"]:
+            rows.append({
+                **{k: v for k, v in provider.items() if k != "keys"},
+                "default_model": provider["models"][0] if provider["models"] else None,
+                "configured": provider["key_count"] > 0,
+                "supported_capabilities": ["chat", "tool_calling"],
+                "default_concurrency": 1,
+                "keys": provider["keys"],
+            })
+        return rows
+
+    def set_provider_enabled(self, provider: str, enabled: bool) -> dict:
+        try:
+            self.catalog.set_provider_enabled(provider, enabled)
+        except CatalogError as error:
+            raise SetupError(str(error)) from error
+        return {"provider": provider.lower(), "enabled": enabled}
+
+    def get_models(self, provider: str | None = None) -> list[dict]:
+        configured = {p for p in self.catalog.providers if self.gateway.keys.keys_for(p)}
+        results = []
+        for model in self.catalog.all_models(provider):
+            row = model.to_dict()
+            available = self.gateway.health.route_available(model.ref)
+            row["is_configured"] = model.provider in configured
+            # Same lifecycle vocabulary the UI has always received.
+            row["state"] = ("active" if available else "degraded") if row["is_configured"] else "unconfigured"
+            row["roles"] = [role for role, refs in self.catalog.roles.items() if model.ref in refs]
+            row.update(_legacy_model_fields(model))
+            results.append(row)
+        return results
+
+    def refresh_models(self, provider: str | None = None, per_provider_timeout: float = 10.0) -> dict:
+        """Ask each configured provider which models it offers and add new ones to the catalog."""
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+
+        targets = [provider.lower()] if provider else [p for p, spec in self.catalog.providers.items() if spec.enabled]
+        jobs = {}
+        for pid in targets:
+            spec = self.catalog.provider(pid)
+            keys = self.gateway.keys.keys_for(pid)
+            secret = self.gateway.keys.secret(keys[0].key_id) if keys else None
+            if spec and secret:
+                jobs[pid] = (spec, secret)
+
+        refreshed: dict[str, int] = {}
+        errors: dict[str, str] = {}
+        if jobs:
+            with ThreadPoolExecutor(max_workers=min(4, len(jobs)), thread_name_prefix="qz-discover") as pool:
+                futures = {
+                    pid: pool.submit(self.gateway.adapter(spec).list_models, api_key=secret, timeout=per_provider_timeout)
+                    for pid, (spec, secret) in jobs.items()
+                }
+                for pid, future in futures.items():
+                    try:
+                        models = future.result(timeout=per_provider_timeout + 2)
+                    except FutureTimeoutError:
+                        errors[pid] = f"Discovery timed out after {per_provider_timeout:.0f}s."
+                        continue
+                    except Exception as error:
+                        errors[pid] = getattr(error, "kind", "error") + ": " + str(error)[:200]
+                        continue
+                    new = {
+                        m["id"]: {k: v for k, v in (("context_window", m.get("context_window")), ("tools", m.get("tools"))) if v is not None}
+                        for m in models if m.get("id")
+                    }
+                    if new:
+                        self.catalog.add_models(pid, new)
+                    refreshed[pid] = len(new)
+        result: dict[str, Any] = {"refreshed": refreshed, "total_models": len(self.catalog.all_models())}
+        if errors:
+            result["errors"] = errors
+        return result
+
+    def set_preferred_model(self, alias: str, provider: str, model_id: str) -> dict:
+        """Put ``provider/model_id`` first in a role (``alias`` may be a legacy alias name)."""
+        try:
+            self.catalog.set_role_preference(alias, provider, model_id)
+        except CatalogError as error:
+            raise SetupError(str(error)) from error
+        role = self.catalog.resolve_role(alias) or alias
+        return {"alias": role, "provider": provider.lower(), "model_id": model_id, "order": list(self.catalog.roles.get(role, ()))}
+
+    # ---- diagnostics ------------------------------------------------------------
+
+    def check_health(self, workspace: str | None = None) -> dict:
         from qz_health import check_system_health
-        report = check_system_health(workspace=workspace, keystore=self.keystore)
-        return report.to_dict()
+
+        return check_system_health(workspace=workspace, keystore=self.keystore).to_dict()
 
     def intelligence_summary(self) -> dict:
-        """Observed operational recommendations; no synthetic provider probes."""
+        """Observed routing evidence: success/latency per model and key health."""
         usage = self.usage_tracker.summary()
         models = usage.get("by_model", {})
-        ranked = sorted(models.items(), key=lambda item: (
-            item[1].get("success_rate", 0), -item[1].get("latency_ms", float("inf"))
-        ), reverse=True)
+        ranked = sorted(models.items(), key=lambda item: (item[1].get("success_rate", 0), -item[1].get("latency_ms", 0)), reverse=True)
         fastest = min(models.items(), key=lambda item: item[1].get("latency_ms", float("inf")), default=(None, {}))
-        degraded = [model.to_dict() for model in __import__("qz_providers.model_registry", fromlist=["get_model_registry"]).get_model_registry().list_models(include_historical=True)
-                    if model.state.value in {"degraded", "unavailable"}]
+        routing = self.gateway.status()
+        degraded = []
+        for route, info in routing["routes"].items():
+            if info["available"]:
+                continue
+            provider_id, _, model_id = route.partition("/")
+            degraded.append({
+                "provider": provider_id, "model_id": model_id, "display_name": route, "ref": route,
+                "state": "unavailable" if info.get("last_error_kind") == "model_not_found" else "degraded",
+                "consecutive_failures": info.get("consecutive_failures", 0),
+                "cooldown_remaining_s": info.get("cooldown_remaining_s", 0.0),
+            })
         return {
             "evidence": "observed",
             "best_overall": ranked[0][0] if ranked else None,
@@ -519,57 +343,144 @@ class DesktopBackend:
             "providers": usage.get("by_provider", {}),
             "models": models,
             "keys": usage.get("by_key", {}),
+            "routing": routing,
             "quota_note": "Quota values are provider-confirmed only when a provider response supplies them; all other health is observed.",
         }
 
+    def benchmark_report(self) -> dict:
+        """Task/subtask/repair/validation statistics plus per-model usage (same shape as before)."""
+        import json as _json
+        from collections import defaultdict
 
-# ---- CLI ------------------------------------------------------------------
+        from qz_tasks.task_manager import get_manager
+
+        report: dict[str, Any] = {
+            "total_tasks": 0, "completed_tasks": 0, "failed_tasks": 0, "task_success_rate": 0.0,
+            "total_nodes": 0, "completed_nodes": 0, "failed_nodes": 0, "node_success_rate": 0.0,
+            "repair_attempts": 0, "successful_repairs": 0, "total_tokens": 0, "total_cost": 0.0,
+            "average_task_duration": 0.0, "failure_categories": {}, "models": {}, "validation_pass_rates": {},
+        }
+        try:
+            with get_manager()._session() as conn:
+                for status, count in conn.execute("SELECT upper(status), count(*) FROM tasks GROUP BY upper(status)"):
+                    report["total_tasks"] += count
+                    if status == "COMPLETED":
+                        report["completed_tasks"] += count
+                    elif status in ("FAILED", "CANCELLED"):
+                        report["failed_tasks"] += count
+                for status, count in conn.execute("SELECT upper(status), count(*) FROM subtasks GROUP BY upper(status)"):
+                    report["total_nodes"] += count
+                    if status == "COMPLETED":
+                        report["completed_nodes"] += count
+                    elif status in ("FAILED", "CANCELLED", "BLOCKED"):
+                        report["failed_nodes"] += count
+                report["repair_attempts"] = conn.execute(
+                    "SELECT count(*) FROM task_events WHERE event_type IN ('NODE_RETRYING', 'REPAIR_ATTEMPT')"
+                ).fetchone()[0]
+                validation: dict[str, dict[str, int]] = defaultdict(lambda: {"pass": 0, "fail": 0})
+                failures: dict[str, int] = defaultdict(int)
+                rows = conn.execute(
+                    "SELECT event_type, payload FROM task_events WHERE event_type IN ('VALIDATION_CHECK', 'NODE_COMPLETED')"
+                )
+                for event_type, raw in rows:
+                    try:
+                        payload = _json.loads(raw) if raw else {}
+                    except ValueError:
+                        payload = {}
+                    if event_type == "NODE_COMPLETED":
+                        if int(payload.get("attempts") or 1) > 1:
+                            report["successful_repairs"] += 1
+                        continue
+                    name, status = payload.get("name", "unknown"), payload.get("status", "")
+                    if status == "PASS":
+                        validation[name]["pass"] += 1
+                    elif status in ("FAIL", "ERROR"):
+                        validation[name]["fail"] += 1
+                        failures[str(name).upper()] += 1
+                report["validation_pass_rates"] = {
+                    name: round(c["pass"] / (c["pass"] + c["fail"]) * 100.0, 1)
+                    for name, c in validation.items() if c["pass"] + c["fail"]
+                }
+                report["failure_categories"] = dict(failures)
+        except Exception:
+            pass
+        if report["total_tasks"]:
+            report["task_success_rate"] = round(report["completed_tasks"] / report["total_tasks"] * 100.0, 1)
+        if report["total_nodes"]:
+            report["node_success_rate"] = round(report["completed_nodes"] / report["total_nodes"] * 100.0, 1)
+
+        usage = self.usage_tracker.summary()
+        report["total_tokens"] = usage.get("total_tokens", 0)
+        report["total_cost"] = usage.get("estimated_cost", 0.0)
+        by_model: dict[str, list[dict]] = defaultdict(list)
+        for event in self.usage_tracker.recent_events(limit=1000):
+            by_model[str(event.get("model") or "unknown")].append(event)
+        for name, events in by_model.items():
+            total = len(events)
+            ok = sum(1 for e in events if e.get("success"))
+            duration = sum(float(e.get("duration") or 0.0) for e in events)
+            report["models"][name] = {
+                "model": name,
+                "provider": events[0].get("provider") or name.split("/")[0],
+                "total_requests": total,
+                "successful_requests": ok,
+                "failed_requests": total - ok,
+                "fallback_count": sum(1 for e in events if e.get("fallback_from")),
+                "total_tokens": sum(int(e.get("total_tokens") or 0) for e in events),
+                "total_cost": round(sum(float(e.get("estimated_cost") or 0.0) for e in events), 6),
+                "average_latency": round(duration / total, 3) if total else 0.0,
+                "success_rate": round(ok / total * 100.0, 1) if total else 0.0,
+            }
+        return report
 
 
-def _print_json(payload: dict) -> None:
-    print(json.dumps(payload, indent=2, default=str))
+def _legacy_model_fields(model) -> dict:
+    """Fields the desktop UI received from the previous model registry."""
+    capabilities = ["chat", "streaming"] + (["tool_calling"] if model.tools else [])
+    if model.context_window >= 65536:
+        capabilities.append("large_context")
+    return {
+        "capabilities": capabilities,
+        "max_output_tokens": None,
+        "input_modalities": ["text"],
+        "output_modalities": ["text"],
+        "supports_vision": False,
+        "supports_streaming": True,
+        "supports_reasoning": False,
+        "supports_structured_output": True,
+        "consecutive_failures": 0,
+        "last_discovery_time": None,
+        "pricing_input_per_1m": None,
+        "pricing_output_per_1m": None,
+        "source": "catalog",
+        "historical": False,
+    }
+
+
+# ---- CLI --------------------------------------------------------------------------
 
 
 def cli_main(argv: list[str] | None = None) -> int:
-    import multiprocessing
-    multiprocessing.freeze_support()
-    from qz_proxy_manager import RUN_LITELLM_PROXY_FLAG, run_embedded_litellm_proxy
-    effective_argv = list(argv if argv is not None else sys.argv[1:])
-    if RUN_LITELLM_PROXY_FLAG in effective_argv:
-        return run_embedded_litellm_proxy(effective_argv)
-
-    parser = argparse.ArgumentParser(prog="qazterion-setup", description="Qazterion Phase 12 desktop backend CLI.")
-    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="Path to config.yaml (default: config.yaml)")
+    parser = argparse.ArgumentParser(prog="qazterion-setup", description="Qazterion provider/key setup.")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("setup", help="Interactive first-run API key setup.")
-    sub.add_parser("status", help="Print proxy/provider/usage status as JSON.")
-    sub.add_parser("config", help="Regenerate config.yaml from enabled keys only.")
-    sub.add_parser("apply", help="Regenerate config.yaml and (re)start the proxy.")
-    sub.add_parser("start", help="Start the proxy if it is not already running.")
-    sub.add_parser("stop", help="Stop the proxy.")
-    sub.add_parser("restart", help="Restart the proxy.")
+    sub.add_parser("setup", help="Interactively store API keys.")
+    sub.add_parser("status", help="Print providers, keys (masked), roles and usage as JSON.")
     args = parser.parse_args(argv)
-
-    backend = DesktopBackend(config_path=args.config)
+    backend = DesktopBackend()
     try:
         if args.command == "setup":
-            _print_json(backend.first_run_setup(interactive=True))
-        elif args.command == "status":
-            _print_json(backend.status())
-        elif args.command == "config":
-            _print_json(backend.generate_configuration())
-        elif args.command == "apply":
-            _print_json(backend.apply_and_start())
-        elif args.command == "start":
-            _print_json(backend.start())
-        elif args.command == "stop":
-            _print_json(backend.stop())
-        elif args.command == "restart":
-            _print_json(backend.proxy_manager.restart(env_overrides=backend.keystore.enabled_env()).to_dict())
-    except SetupError as error:
+            print(json.dumps(backend.first_run_setup(interactive=True), indent=2))
+        else:
+            print(json.dumps(backend.status(), indent=2, default=str))
+    except (SetupError, ValueError) as error:
         print(f"Setup error: {error}", file=sys.stderr)
         return 1
+    finally:
+        backend.shutdown()
     return 0
+
+
+__all__ = ["DesktopBackend", "SetupError", "SUPPORTED_PROVIDERS", "cli_main"]
 
 
 if __name__ == "__main__":

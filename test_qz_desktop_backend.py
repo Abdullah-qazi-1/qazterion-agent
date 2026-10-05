@@ -1,184 +1,136 @@
-import sys
+"""Desktop backend: key setup, status, configuration and model management (no proxy)."""
+
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
-
-import yaml
+from types import SimpleNamespace
 
 from qz_desktop_backend import DesktopBackend, SetupError
 from qz_keystore import KeyStore
-from qz_proxy_manager import ProxyStatus
+from qz_providers.catalog import ProviderCatalog
+from qz_providers.gateway import ModelGateway
+from qz_providers.health import HealthTracker
+from qz_providers.keys import KeySource
 from qz_usage_tracker import UsageTracker
 
-SAMPLE_CONFIG = """model_list:
-  - model_name: groq-fast
-    litellm_params:
-      model: groq/model-a
-      api_key: os.environ/GROQ_KEY_1
-  - model_name: coder-strong
-    litellm_params:
-      model: mistral/coder
-      api_key: os.environ/MISTRAL_KEY_1
-  - model_name: reasoner
-    litellm_params:
-      model: mistral/reasoner
-      api_key: os.environ/MISTRAL_KEY_1
-router_settings:
-  fallbacks:
-    - coder-strong: [groq-fast]
-"""
+
+class _FakeAdapter:
+    models = [{"id": "brand-new-model", "context_window": 65536, "tools": True}]
+
+    def __init__(self, spec):
+        self.spec = spec
+
+    def complete(self, **kwargs):
+        message = SimpleNamespace(content="ok", tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None, model=kwargs["model"])
+
+    def list_models(self, **_kwargs):
+        return list(self.models)
+
+    def check_key(self, **_kwargs):
+        return 1
+
+    def close(self):
+        pass
 
 
 class DesktopBackendTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.workspace = Path(self.temp_dir.name)
-        self.config_path = self.workspace / "config.yaml"
-        self.config_path.write_text(SAMPLE_CONFIG, encoding="utf-8")
-        self.keystore = KeyStore(path=self.workspace / "keystore.dat", backend="fernet")
-        self.proxy_manager = MagicMock()
-        self.usage_tracker = UsageTracker(log_path=None)
-        self.backend = DesktopBackend(
-            keystore=self.keystore,
-            proxy_manager=self.proxy_manager,
-            usage_tracker=self.usage_tracker,
-            config_path=self.config_path,
+        root = Path(self.temp_dir.name)
+        self.keystore = KeyStore(path=root / "keystore.dat", backend="fernet")
+        self.catalog = ProviderCatalog(user_path=root / "providers.yaml")
+        self.gateway = ModelGateway(
+            catalog=self.catalog,
+            keys=KeySource(self.catalog, keystore_factory=lambda: self.keystore, environ={}, cache_ttl_s=0),
+            health=HealthTracker(persist=False),
+            adapter_factory=_FakeAdapter,
+            sleep=lambda _s: None,
+            log=lambda _m: None,
         )
+        self.usage = UsageTracker(log_path=None)
+        self.backend = DesktopBackend(keystore=self.keystore, usage_tracker=self.usage, gateway=self.gateway)
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    # ---- first-run setup --------------------------------------------------
-
-    def test_first_run_setup_configures_every_supported_provider(self):
-        keys = {
-            "groq": ["g1", "g2"],
-            "gemini": ["gem1"],
-            "mistral": ["m1"],
-            "openrouter": ["or1"],
-            "deepseek": ["ds1"],
-        }
-        result = self.backend.first_run_setup(keys=keys, master_key="master-value")
-        self.assertEqual(
-            result["configured_providers"],
-            {"groq": 2, "gemini": 1, "mistral": 1, "openrouter": 1, "deepseek": 1},
-        )
-        self.assertEqual(result["unconfigured_providers"], [])
-        self.assertTrue(result["master_key_set"])
-        self.assertEqual(self.keystore.get_master_key(), "master-value")
-
-    def test_first_run_setup_with_partial_providers_reports_the_rest_as_unconfigured(self):
-        result = self.backend.first_run_setup(keys={"groq": ["g1"]}, master_key="m")
-        self.assertEqual(result["configured_providers"], {"groq": 1})
+    def test_first_run_setup_stores_multiple_keys_per_provider(self):
+        result = self.backend.first_run_setup(keys={"groq": ["g1-aaaaaaaa", "g2-bbbbbbbb"], "gemini": ["gem1-cccccc"]})
+        self.assertEqual(result["configured_providers"], {"groq": 2, "gemini": 1})
         self.assertIn("mistral", result["unconfigured_providers"])
+        self.assertEqual([k.key_id for k in self.gateway.keys.keys_for("groq")], ["GROQ_KEY_1", "GROQ_KEY_2"])
 
-    def test_missing_master_key_is_auto_generated_not_left_unset(self):
-        result = self.backend.first_run_setup(keys={"groq": ["g1"]})
-        self.assertTrue(result["master_key_set"])
-        self.assertIsNotNone(self.keystore.get_master_key())
+    def test_first_run_setup_appends_without_duplicating(self):
+        self.backend.first_run_setup(keys={"groq": ["g1-aaaaaaaa"]})
+        self.backend.first_run_setup(keys={"groq": ["g1-aaaaaaaa", "g2-bbbbbbbb"]})
+        names = [e.env_name for e in self.keystore.list_entries(provider="groq")]
+        self.assertEqual(names, ["GROQ_KEY_1", "GROQ_KEY_2"])
 
-    # ---- configuration generation -----------------------------------------
-
-    def test_generate_configuration_expands_multiple_keys_correctly(self):
-        self.backend.first_run_setup(keys={"groq": ["g1", "g2"], "mistral": ["m1"]}, master_key="m")
-        result = self.backend.generate_configuration()
-        persisted = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
-        groq_entries = [e for e in persisted["model_list"] if e["model_name"] == "groq-fast"]
-        self.assertEqual(
-            [e["litellm_params"]["api_key"] for e in groq_entries],
-            ["os.environ/GROQ_KEY_1", "os.environ/GROQ_KEY_2"],
-        )
-        self.assertEqual(result["model_entries"], len(persisted["model_list"]))
-        self.assertIn("GROQ_KEY", result["configured_families"])
-
-    def test_generate_configuration_warns_about_unconfigured_provider(self):
-        self.backend.first_run_setup(keys={"groq": ["g1"]}, master_key="m")
-        result = self.backend.generate_configuration()
-        self.assertTrue(any("MISTRAL_KEY_1" in warning for warning in result["warnings"]))
-
-    def test_generate_configuration_missing_template_is_a_clear_setup_error(self):
-        backend = DesktopBackend(
-            keystore=self.keystore,
-            proxy_manager=self.proxy_manager,
-            usage_tracker=self.usage_tracker,
-            config_path=self.workspace / "does-not-exist.yaml",
-        )
-        with self.assertRaises(SetupError):
-            backend.generate_configuration()
-
-    def test_disabled_key_is_not_used_when_regenerating_config(self):
-        self.backend.first_run_setup(keys={"groq": ["g1", "g2"]}, master_key="m")
-        self.keystore.set_enabled("groq", 2, False)
-        self.backend.generate_configuration()
-        persisted = yaml.safe_load(self.config_path.read_text(encoding="utf-8"))
-        groq_keys = [e["litellm_params"]["api_key"] for e in persisted["model_list"] if e["model_name"] == "groq-fast"]
-        self.assertEqual(groq_keys, ["os.environ/GROQ_KEY_1"])
-
-    # ---- validation ------------------------------------------------------
-
-    def test_validate_configuration_flags_missing_master_key(self):
-        self.backend.first_run_setup(keys={"groq": ["g1"]})  # auto-generates master key
-        self.assertTrue(self.backend.validate_configuration()["valid"])
-
-    def test_validate_configuration_flags_empty_model_list(self):
-        self.config_path.write_text("model_list: []\n", encoding="utf-8")
-        self.keystore.set_master_key("m")
-        result = self.backend.validate_configuration()
-        self.assertFalse(result["valid"])
-        self.assertTrue(any("model_list" in e for e in result["errors"]))
-
-    # ---- apply / lifecycle --------------------------------------------------
-
-    def test_proxy_manager_uses_venv_litellm_launcher(self):
-        from qz_proxy_manager import ProxyManager
-
-        manager = ProxyManager()
-        self.assertTrue(Path(manager._command[0]).name.startswith("litellm"))
-        self.assertEqual(manager._command[1], "--config")
-
-    def test_apply_and_start_restarts_proxy_with_enabled_env_only(self):
-        self.backend.first_run_setup(keys={"groq": ["g1"], "mistral": ["m1"]}, master_key="master")
-        self.proxy_manager.restart.return_value = ProxyStatus(
-            running=True, healthy=True, pid=1, crashed=False, last_error=None
-        )
-        result = self.backend.apply_and_start()
-        called_env = self.proxy_manager.restart.call_args.kwargs["env_overrides"]
-        self.assertEqual(called_env["GROQ_KEY_1"], "g1")
-        self.assertEqual(called_env["LITELLM_MASTER_KEY"], "master")
-        self.assertTrue(result["proxy"]["healthy"])
-
-    def test_apply_and_start_refuses_to_start_with_invalid_configuration(self):
-        self.config_path.write_text("model_list: []\n", encoding="utf-8")
-        with self.assertRaises(SetupError):
-            self.backend.apply_and_start()
-        self.proxy_manager.restart.assert_not_called()
-
-    def test_shutdown_stops_proxy_when_configured_to(self):
-        self.backend.stop_proxy_on_exit = True
-        self.backend.shutdown()
-        self.proxy_manager.stop.assert_called_once()
-
-    def test_shutdown_leaves_proxy_running_when_configured_not_to(self):
-        self.backend.stop_proxy_on_exit = False
-        self.backend.shutdown()
-        self.proxy_manager.stop.assert_not_called()
-
-    # ---- status -------------------------------------------------------------
-
-    def test_status_reports_masked_keys_aliases_and_usage(self):
-        self.backend.first_run_setup(keys={"groq": ["sk-abcdefghijklmno"]}, master_key="m")
-        self.backend.generate_configuration()
-        self.proxy_manager.status.return_value = ProxyStatus(
-            running=True, healthy=True, pid=99, crashed=False, last_error=None
-        )
-        self.usage_tracker.record_request(model="groq-fast", duration=0.2, success=True)
+    def test_status_reports_masked_keys_roles_and_connection(self):
+        self.assertFalse(self.backend.status()["proxy"]["healthy"])
+        self.backend.first_run_setup(keys={"groq": ["sk-abcdefghijklmno"]})
+        self.usage.record_request(model="groq/x", duration=0.2, success=True)
         status = self.backend.status()
-        self.assertIn("groq-fast", status["aliases"])
-        self.assertEqual(status["fallback_order"], {"coder-strong": ["groq-fast"]})
+        self.assertTrue(status["proxy"]["healthy"])
+        self.assertEqual(status["proxy"]["state"], "direct")
+        self.assertIn("coder", status["aliases"])
+        self.assertTrue(status["fallback_order"]["coder"])
         self.assertNotIn("sk-abcdefghijklmno", str(status))
         self.assertEqual(status["usage"]["request_count"], 1)
-        self.assertTrue(status["master_key_set"])
+
+    def test_validate_configuration_requires_a_usable_key(self):
+        self.assertFalse(self.backend.validate_configuration()["valid"])
+        self.backend.first_run_setup(keys={"gemini": ["AIza-test-key-1234"]})
+        self.assertEqual(self.backend.validate_configuration(), {"valid": True, "errors": []})
+        warnings = self.backend.generate_configuration()["warnings"]
+        self.assertFalse(any("'coder'" in w for w in warnings))
+
+    def test_disabled_key_and_provider_are_not_used(self):
+        self.backend.first_run_setup(keys={"groq": ["g1-aaaaaaaa"]})
+        self.backend.set_key_enabled("groq", 1, False)
+        self.assertEqual(self.gateway.keys.keys_for("groq"), [])
+        self.backend.set_key_enabled("groq", 1, True)
+        self.assertEqual(len(self.gateway.keys.keys_for("groq")), 1)
+        self.backend.set_provider_enabled("groq", False)
+        plan, skipped = self.gateway.plan("fast")
+        self.assertFalse(any(model.provider == "groq" for model, _p, _k in plan))
+        self.assertTrue(any("provider disabled" in s for s in skipped))
+
+    def test_set_preferred_model_reorders_role_and_persists(self):
+        result = self.backend.set_preferred_model("coder-strong", "groq", "llama-3.1-8b-instant")
+        self.assertEqual(result["alias"], "coder")
+        self.assertEqual(result["order"][0], "groq/llama-3.1-8b-instant")
+        reloaded = ProviderCatalog(user_path=self.catalog.user_path)
+        self.assertEqual(reloaded.roles["coder"][0], "groq/llama-3.1-8b-instant")
+
+    def test_routing_strategy_accepts_legacy_names(self):
+        self.assertEqual(self.backend.set_routing_strategy("simple-shuffle"), {"strategy": "simple-shuffle", "effective_strategy": "balanced"})
+        self.assertEqual(self.backend.set_routing_strategy("lowest-cost"), {"strategy": "lowest-cost", "effective_strategy": "priority"})
+        with self.assertRaises(SetupError):
+            self.backend.set_routing_strategy("random")
+
+    def test_register_custom_provider_makes_it_routable(self):
+        result = self.backend.register_custom_provider(
+            "acme", "acme-secret-key-123", display_name="Acme AI",
+            base_url="https://api.acme.example/v1", default_model="acme-coder",
+        )
+        self.assertEqual(result["env_name"], "ACME_KEY_1")
+        self.assertIn("acme/acme-coder", self.catalog.roles["coder"])
+        response = self.gateway.complete("acme/acme-coder", [{"role": "user", "content": "hi"}])
+        self.assertEqual(response.route.provider, "acme")
+
+    def test_refresh_models_adds_discovered_models_to_catalog(self):
+        self.backend.first_run_setup(keys={"groq": ["g1-aaaaaaaa"]})
+        result = self.backend.refresh_models("groq")
+        self.assertEqual(result["refreshed"], {"groq": 1})
+        self.assertIn("brand-new-model", self.catalog.providers["groq"].models)
+        models = {m["ref"]: m for m in self.backend.get_models("groq")}
+        self.assertTrue(models["groq/brand-new-model"]["is_configured"])
+
+    def test_check_health_reports_host_execution_without_docker(self):
+        report = self.backend.check_health()
+        self.assertEqual(report["components"]["execution"]["metadata"]["isolation"], "host")
+        self.assertNotIn("docker", report["components"])
 
 
 if __name__ == "__main__":

@@ -1,300 +1,76 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import re
 import sys
-import time
-import uuid
+import os
 from dataclasses import dataclass
 from openai import OpenAI
 
-from qz_core.client import get_client
-from qz_core.classifier import classify_task_complexity, COMPLEXITY_MODEL_MAP
-from qz_core.common import _persist_task
-from qz_core.git_ops import generate_commit_message, _commit_hash_from_result
-from qz_core.reviewer import self_review
+from qz_core.client import accepts_task_id, get_client
+# Re-exported for qz_core.dag_executor, which looks these up at call time.
+from qz_core.classifier import classify_task_complexity, COMPLEXITY_MODEL_MAP  # noqa: F401
 from qz_environment import detect_project_environment
 import qz_tools
-from qz_tools import TOOL_SCHEMAS, TOOL_FUNCTIONS, WORKSPACE, commit_changes, run_command
-from qz_usage_tracker import UsageTracker, default_usage_log_path
-from qz_tasks.models import TaskStatus
-from qz_pool import get_pool
-from qz_router import get_router, select_route
+from qz_tools import run_command
+from qz_usage_tracker import UsageTracker, get_usage_tracker
 from qz_security.redaction import redact
-from qz_validation import ValidationPipeline, ValidationReport, CheckStatus
+from qz_validation import ValidationPipeline  # noqa: F401  (used via executor_mod)
 
-# Retry a provider briefly, then let LiteLLM route the same request through an
-# alternate alias.  The complete message history is preserved by the caller.
-EXECUTOR_FALLBACKS = {
-    "coder-strong": ("coder-strong", "groq-fast", "coder-backup", "reasoner"),
-    "groq-fast": ("groq-fast", "coder-backup", "reasoner"),
-    "reasoner": ("reasoner", "groq-fast", "coder-backup"),
-}
-MODEL_REQUEST_ATTEMPTS = 2
-USAGE_TRACKER = UsageTracker(log_path=default_usage_log_path())
-
-
-def _provider_failure_kind(error: Exception) -> str | None:
-    """Classify provider errors conservatively for temporary fallback routing."""
-    message = str(error).lower()
-    if any(marker in message for marker in ("quota", "insufficient credits", "insufficient balance", "billing")):
-        return "quota_exhausted"
-    if "429" in message or "rate limit" in message or "ratelimit" in message:
-        return "rate_limited"
-    return None
+# The executor asks for roles; the provider catalog decides which provider,
+# model and key serve each role (see qz_providers/default_providers.yaml).
+EXECUTOR_ROLE = "coder"
+ESCALATION_ROLE = "reasoner"
+SUMMARY_ROLE = "fast"
 
 
 def request_completion(*, model: str, messages: list[dict], tools=None, temperature: float = 0.2,
                        max_tokens: int | None = None, fallbacks: tuple[str, ...] | None = None,
                        usage_tracker: UsageTracker | None = None, client: OpenAI | None = None,
                        task_id: str | None = None):
-    """Return a usable model response after bounded retry and smart route failover.
+    """Return ``(response, role_used)`` for a chat request.
 
-    An empty assistant message is treated as a failed response because it cannot
-    advance a tool-driven task. No tool is executed until a response is returned.
+    ``model`` is a role (or ``provider/model``). Key rotation and provider/model
+    failover inside a role are handled by the gateway; ``fallbacks`` lists extra
+    roles to try, in order, only if every model of the requested role failed.
     """
-    c = get_client(client)
-    tracker = usage_tracker or USAGE_TRACKER
-    pool = get_pool()
-    router = get_router()
-
-    # Pre-request admission check against task budget limits
+    tracker = usage_tracker or get_usage_tracker()
     if tracker is not None and task_id:
         admitted, block_reason = tracker.admit_request(task_id)
         if not admitted:
             raise RuntimeError(f"Request blocked by task budget: {block_reason}")
 
-    candidate_aliases = list(fallbacks) if fallbacks is not None else [model]
+    c = get_client(client)
+    roles = list(dict.fromkeys([model, *(fallbacks or ())]))
+    failures: list[str] = []
+    for role in roles:
+        kwargs = {"model": role, "messages": messages, "temperature": temperature}
+        if tools is not None:
+            kwargs["tools"] = tools
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        if accepts_task_id(c):
+            kwargs["task_id"] = task_id
+        try:
+            response = c.chat.completions.create(**kwargs)
+            if not getattr(response, "choices", None):
+                raise RuntimeError("provider returned no choices")
+            message = response.choices[0].message
+            if not (getattr(message, "content", None) or getattr(message, "tool_calls", None)):
+                raise RuntimeError("provider returned an empty assistant message")
+        except Exception as error:
+            failures.append(f"{role}: {redact(str(error))}")
+            continue
 
-    # Filter out aliases/keys flagged in usage_tracker unless all are flagged
-    tracker_excluded: set[str] = set()
-    if tracker is not None:
-        for alias in candidate_aliases:
-            if not tracker.is_key_eligible(alias):
-                tracker_excluded.add(alias)
-            for k in pool.registry.get_keys_for_alias(alias):
-                if not tracker.is_key_eligible(k.id):
-                    tracker_excluded.add(k.id)
-
-    # Exclude flagged only if there is at least one unflagged option remaining
-    excluded = set(tracker_excluded) if len(tracker_excluded) < len(candidate_aliases) else set()
-
-    # Rank candidate routes using SmartRouter live health & concurrency telemetry
-    ranked_routes = router.rank_routes(
-        model,
-        exclude=excluded,
-        fallbacks=tuple(candidate_aliases),
-        task_id=task_id,
-        requires_tools=(tools is not None),
-        requires_reasoning=(model == "reasoner" or "reason" in model.lower()),
-    )
-
-    failures = []
-    limiter = getattr(pool, "concurrency", None)
-
-    for candidate, candidate_key, _ in ranked_routes:
-        raw_key = None
-        if candidate_key:
-            try:
-                raw_key = pool.registry.get_key_value(candidate_key)
-            except Exception:
-                pass
-
-        for attempt in range(MODEL_REQUEST_ATTEMPTS):
-            request_id = str(uuid.uuid4())
-            started = time.monotonic()
-            slot_ctx = limiter.slot(candidate_key) if (limiter and candidate_key) else contextlib.nullcontext()
-            try:
-                kwargs = {"model": candidate, "messages": messages, "temperature": temperature}
-                if tools is not None:
-                    kwargs["tools"] = tools
-                if max_tokens is not None:
-                    kwargs["max_tokens"] = max_tokens
-                if raw_key:
-                    kwargs["api_key"] = raw_key
-
-                with slot_ctx:
-                    response = c.chat.completions.create(**kwargs)
-
-                if not response.choices:
-                    raise RuntimeError("provider returned no choices")
-                message = response.choices[0].message
-                if not (getattr(message, "content", None) or getattr(message, "tool_calls", None)):
-                    raise RuntimeError("provider returned an empty assistant message")
-                duration = time.monotonic() - started
-                actual_model = getattr(response, "model", None) or candidate
-                usage_obj = getattr(response, "usage", None)
-                in_tokens = int(getattr(usage_obj, "prompt_tokens", 0) or 0) if usage_obj else 0
-                out_tokens = int(getattr(usage_obj, "completion_tokens", 0) or 0) if usage_obj else 0
-                tot_tokens = int(getattr(usage_obj, "total_tokens", 0) or 0) if usage_obj else 0
-                is_estimated = False
-
-                if tot_tokens == 0:
-                    try:
-                        from qz_context import estimate_tokens
-                        in_tokens = estimate_tokens(json.dumps(messages, default=str))
-                        out_text = str(getattr(message, "content", "") or "")
-                        if getattr(message, "tool_calls", None):
-                            out_text += str(message.tool_calls)
-                        out_tokens = estimate_tokens(out_text)
-                        tot_tokens = in_tokens + out_tokens
-                        is_estimated = True
-                    except Exception:
-                        pass
-
-                prov_id = None
-                try:
-                    from qz_providers.model_registry import get_model_registry
-                    model_reg = get_model_registry()
-                    meta = model_reg.get_model_by_alias(candidate)
-                    if meta:
-                        prov_id = meta.provider
-                        model_reg.record_model_success(meta.provider, meta.model_id, task_id=task_id)
-                except Exception:
-                    pass
-
-                tracker.record_request(
-                    model=actual_model,
-                    provider=prov_id,
-                    key_id=candidate_key,
-                    task_id=task_id,
-                    duration=duration,
-                    success=True,
-                    input_tokens=in_tokens,
-                    output_tokens=out_tokens,
-                    total_tokens=tot_tokens,
-                    is_estimated=is_estimated,
-                    fallback_from=model if candidate != model else None,
-                    task_type="coding",
-                    retry_count=attempt,
-                    request_id=request_id,
-                )
-                try:
-                    from qz_storage import get_storage
-                    get_storage().record_model_call(
-                        provider=prov_id or "unknown",
-                        model=actual_model,
-                        input_tokens=in_tokens,
-                        output_tokens=out_tokens,
-                        latency_ms=duration * 1000.0,
-                        success=True,
-                        error=None,
-                        task_id=task_id,
-                    )
-                except Exception:
-                    pass
-
-                tracker.clear_flag(candidate)
-                if candidate_key:
-                    tracker.clear_flag(candidate_key)
-                try:
-                    pool.health_manager.record_success(candidate_key, latency_ms=duration * 1000.0)
-                except Exception:
-                    pass
-
-                # Check budget
-                budget_ok, budget_msg, is_warn = tracker.check_task_budget(task_id)
-                if budget_msg:
-                    if is_warn:
-                        print(f"\033[93m[budget warning]\033[0m {budget_msg}")
-                    else:
-                        print(f"\033[91m[budget exceeded]\033[0m {budget_msg}")
-
-                if candidate != model:
-                    print(f"\033[90m[model routing] failover: {model} -> {candidate} (key: {candidate_key})\033[0m")
-                return response, candidate
-            except Exception as error:
-                duration = time.monotonic() - started
-                failed_in_tokens = 0
-                try:
-                    from qz_context import estimate_tokens
-                    failed_in_tokens = estimate_tokens(json.dumps(messages, default=str))
-                except Exception:
-                    pass
-
-                prov_id = None
-                try:
-                    from qz_providers.model_registry import get_model_registry
-                    model_reg = get_model_registry()
-                    meta = model_reg.get_model_by_alias(candidate)
-                    if meta:
-                        prov_id = meta.provider
-                except Exception:
-                    pass
-
-                redacted_err = redact(str(error))
-
-                tracker.record_request(
-                    model=candidate,
-                    provider=prov_id,
-                    key_id=candidate_key,
-                    task_id=task_id,
-                    duration=duration,
-                    success=False,
-                    input_tokens=failed_in_tokens,
-                    output_tokens=0,
-                    total_tokens=failed_in_tokens,
-                    is_estimated=True if failed_in_tokens > 0 else False,
-                    error=redacted_err,
-                    fallback_from=model if candidate != model else None,
-                    task_type="coding",
-                    retry_count=attempt,
-                    request_id=request_id,
-                )
-                try:
-                    from qz_storage import get_storage
-                    get_storage().record_model_call(
-                        provider=prov_id or "unknown",
-                        model=candidate,
-                        input_tokens=failed_in_tokens,
-                        output_tokens=0,
-                        latency_ms=duration * 1000.0,
-                        success=False,
-                        error=redacted_err,
-                        task_id=task_id,
-                    )
-                except Exception:
-                    pass
-
-                err_type = "other"
-                try:
-                    err_type = pool.health_manager.classify_error(error)
-                    pool.health_manager.record_failure(
-                        candidate_key,
-                        error_type=err_type,
-                        latency_ms=duration * 1000.0,
-                        error_message=redacted_err,
-                    )
-                except Exception:
-                    pass
-                try:
-                    from qz_providers.model_registry import get_model_registry
-                    model_reg = get_model_registry()
-                    meta = model_reg.get_model_by_alias(candidate)
-                    if meta:
-                        model_reg.record_model_failure(meta.provider, meta.model_id, error=error, task_id=task_id)
-                except Exception:
-                    pass
-                failure_kind = _provider_failure_kind(error)
-                if failure_kind == "quota_exhausted":
-                    tracker.mark_quota_exhausted(candidate)
-                    if candidate_key:
-                        tracker.mark_quota_exhausted(candidate_key)
-                elif failure_kind == "rate_limited":
-                    tracker.mark_rate_limited(candidate)
-                    if candidate_key:
-                        tracker.mark_rate_limited(candidate_key)
-                failures.append(f"{candidate} ({candidate_key}) attempt {attempt + 1}: {redacted_err}")
-                if err_type == "auth_error":
-                    # Permanent auth error - do not retry with the same key
-                    break
-                if failure_kind in ("rate_limited", "quota_exhausted"):
-                    # Rate limit or quota exhausted - fail over immediately to next candidate/key
-                    break
-                if attempt + 1 < MODEL_REQUEST_ATTEMPTS:
-                    time.sleep(attempt + 1)
-    raise RuntimeError("; ".join(failures))
+        if tracker is not None and task_id:
+            _ok, budget_msg, is_warn = tracker.check_task_budget(task_id)
+            if budget_msg:
+                label = "budget warning" if is_warn else "budget exceeded"
+                print(f"\033[93m[{label}]\033[0m {budget_msg}")
+        if role != model:
+            print(f"\033[90m[model routing] role fallback: {model} -> {role}\033[0m")
+        return response, role
+    raise RuntimeError("; ".join(failures) or f"No response for '{model}'")
 
 
 @dataclass(frozen=True)
@@ -322,7 +98,7 @@ def capture_pre_existing_test_failures(workspace: str | None = None) -> TestBase
     agent_mod = sys.modules.get("qz_agent")
     _detect = getattr(agent_mod, "detect_project_environment", detect_project_environment) if agent_mod else detect_project_environment
     _run_cmd = getattr(agent_mod, "run_command", run_command) if agent_mod else run_command
-    _ws = workspace or (getattr(agent_mod, "WORKSPACE", None) if agent_mod else None) or qz_tools.WORKSPACE
+    _ws = workspace or (getattr(agent_mod, "WORKSPACE", None) if agent_mod else None) or qz_tools.current_workspace()
 
     environment = _detect(_ws)
     if not environment.test_command:
@@ -420,7 +196,7 @@ def roll_conversation_summary(messages: list[dict], client: OpenAI | None = None
     c = get_client(client)
     try:
         response = c.chat.completions.create(
-            model="groq-fast",
+            model=SUMMARY_ROLE,
             messages=[
                 {
                     "role": "system",
@@ -489,18 +265,29 @@ Rules:
   genuinely stuck.
 - When the work is complete and tests pass, give a short summary of what you did.
 
-Environment: run_command runs in Windows PowerShell, not bash.
+{environment}"""
+
+_WINDOWS_ENVIRONMENT = """Environment: run_command runs in Windows PowerShell, not bash.
 - Heredoc syntax (`<< 'EOF'`, `<<'PY'` etc.) is INVALID in PowerShell — never use it.
 - For a small inline Python test, use `python -c "..."`.
 - For a multi-line test, first create a small temp `.py` file with write_file, then run it
   with `python temp_file.py`, then delete it once you're done.
-- For command chaining, use PowerShell syntax (`;` or `&&`); avoid bash-specific syntax
-  (`&&` also works, but avoid `||`, backticks, etc.).
+- Chain commands with `;` or `&&`; avoid bash-only syntax such as `||` or backticks."""
+
+_POSIX_ENVIRONMENT = """Environment: run_command runs in /bin/sh.
+- For a small inline Python test, use `python -c "..."`; for longer checks write a temp file.
+- Chain commands with `;` or `&&`."""
+
+_TEST_GUIDANCE = """
 - Always run tests with `python -m unittest discover -s tests` or `python -m pytest`,
   never run a test file directly with `python path/to/test_file.py` — that can cause
   package-relative imports (like `from src.utils import X`) to fail with
   `ModuleNotFoundError`, because direct script-run mode doesn't put the project root on
   sys.path correctly."""
+
+SYSTEM_PROMPT = SYSTEM_PROMPT.format(
+    environment=(_WINDOWS_ENVIRONMENT if os.name == "nt" else _POSIX_ENVIRONMENT) + _TEST_GUIDANCE
+)
 
 
 def run_executor(task: str, plan: str, architecture: str, max_iterations: int = 20,
@@ -511,12 +298,12 @@ def run_executor(task: str, plan: str, architecture: str, max_iterations: int = 
     if not task_id:
         try:
             from qz_tasks.task_manager import create_task
-            task_id = create_task(task, qz_tools.WORKSPACE)
+            task_id = create_task(task, qz_tools.current_workspace())
         except Exception:
             import uuid
             task_id = str(uuid.uuid4())
 
-    executor = HardDAGExecutor(workspace=qz_tools.WORKSPACE, max_node_iterations=max_iterations)
+    executor = HardDAGExecutor(workspace=qz_tools.current_workspace(), max_node_iterations=max_iterations)
     result = executor.execute_dag(
         task_id=task_id,
         task_text=task,

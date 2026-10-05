@@ -33,7 +33,7 @@ class ProjectEnvironmentTests(unittest.TestCase):
             self.assertIn(str(interpreter.resolve()), environment.test_command)
             from qz_sandbox.manager import SandboxManager
 
-            with patch("qz_tools.get_manager", return_value=SandboxManager(docker_available=False)):
+            with patch("qz_tools.get_manager", return_value=SandboxManager()):
                 with patch("qz_sandbox.backend.subprocess.Popen") as popen_mock:
                     popen_mock.return_value.communicate.return_value = ("ok", "")
                     popen_mock.return_value.returncode = 0

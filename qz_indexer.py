@@ -11,9 +11,13 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from qz_paths import atomic_write_text, workspace_state_dir
+
 
 INDEX_FILENAME = ".qazterion_index.json"
 INDEX_VERSION = 4
+# Parsed indexes kept for the life of the process, keyed by workspace path.
+_MEMORY_CACHE: dict[str, dict[str, Any]] = {}
 SOURCE_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".cs",
     ".php", ".rb", ".c", ".cpp", ".h", ".hpp", ".sql", ".sh", ".ps1",
@@ -461,18 +465,11 @@ def build_index(workspace_path: str | os.PathLike[str], existing_index: dict[str
         "files": files,
     }
 
-    cache_path = workspace / INDEX_FILENAME
-    temp_cache_path = workspace / f"{INDEX_FILENAME}.tmp"
     try:
-        temp_cache_path.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
-        if temp_cache_path.exists():
-            temp_cache_path.replace(cache_path)
+        atomic_write_text(index_cache_path(workspace), json.dumps(index, ensure_ascii=False))
     except OSError:
-        try:
-            cache_path.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
-        except OSError:
-            pass
-
+        pass
+    _MEMORY_CACHE[str(workspace)] = index
     return index
 
 
@@ -498,18 +495,36 @@ def _cache_is_current(index: dict[str, Any], workspace: Path) -> bool:
     return True
 
 
+def index_cache_path(workspace: str | os.PathLike[str]) -> Path:
+    """The index cache lives in the per-user data dir, never inside the project."""
+    return workspace_state_dir(workspace) / "index.json"
+
+
+def _remove_legacy_cache(workspace: Path) -> None:
+    # Older versions wrote the cache into the project root, which made every
+    # git working tree look dirty. It is a generated file, so remove it.
+    for name in (INDEX_FILENAME, f"{INDEX_FILENAME}.tmp"):
+        try:
+            (workspace / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def load_or_build_index(workspace_path: str | os.PathLike[str]) -> tuple[dict[str, Any], bool]:
     """Load a current cache, or incrementally rebuild it. Returns ``(index, was_rebuilt)``."""
     workspace = Path(workspace_path).resolve()
-    cache_path = workspace / INDEX_FILENAME
-    existing_index = None
-    try:
-        if cache_path.is_file():
-            existing_index = json.loads(cache_path.read_text(encoding="utf-8"))
-            if _cache_is_current(existing_index, workspace):
-                return existing_index, False
-    except (OSError, json.JSONDecodeError):
-        existing_index = None
+    _remove_legacy_cache(workspace)
+    existing_index = _MEMORY_CACHE.get(str(workspace))
+    if existing_index is None:
+        try:
+            cache_path = index_cache_path(workspace)
+            if cache_path.is_file():
+                existing_index = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_index = None
+    if existing_index is not None and _cache_is_current(existing_index, workspace):
+        _MEMORY_CACHE[str(workspace)] = existing_index
+        return existing_index, False
 
     return build_index(workspace, existing_index=existing_index), True
 

@@ -1,77 +1,67 @@
-"""Qazterion Provider Abstraction, Dynamic Model Management, and Adapters."""
+"""Multi-provider, multi-key model access for Qazterion.
+
+* :mod:`qz_providers.catalog`  - providers, models and roles (YAML, user-overridable)
+* :mod:`qz_providers.keys`     - API keys per provider (keystore + environment)
+* :mod:`qz_providers.health`   - per-key / per-model cooldowns, persisted
+* :mod:`qz_providers.adapters` - wire protocols (OpenAI-compatible, OpenRouter)
+* :mod:`qz_providers.gateway`  - role -> provider/model/key selection with failover
+"""
 
 from __future__ import annotations
 
-from qz_providers.models import (
-    ModelCapability,
-    ModelLifecycleState,
-    ModelMetadata,
-    ProviderInfo,
-)
+from qz_providers.catalog import CatalogError, ModelSpec, ProviderCatalog, ProviderSpec, parse_model_ref
 from qz_providers.exceptions import (
-    ProviderError,
     AuthenticationError,
-    RateLimitError,
-    TimeoutError,
-    ServerError,
+    ConnectionError,
     ContextLengthExceededError,
+    InvalidRequestError,
     ModelNotFoundError,
     ModelUnavailableError,
-    InvalidRequestError,
+    ProviderError,
+    QuotaExhaustedError,
+    RateLimitError,
+    ServerError,
+    TimeoutError,
     normalize_error,
 )
-from qz_providers.adapters import (
-    BaseProviderAdapter,
-    OpenAICompatibleAdapter,
-    GroqAdapter,
-    MistralAdapter,
-    GeminiAdapter,
-    OpenRouterAdapter,
-    DeepSeekAdapter,
-    get_adapter_for_provider,
-    register_adapter,
+from qz_providers.gateway import (
+    GatewayResponse,
+    ModelGateway,
+    NoRouteError,
+    RouteInfo,
+    get_gateway,
+    reset_gateway,
+    set_gateway,
 )
-from qz_providers.registry import (
-    ProviderRegistry,
-    get_provider_registry,
-    reset_provider_registry,
-)
-from qz_providers.model_registry import (
-    ModelRegistry,
-    get_model_registry,
-    reset_model_registry,
-    DEFAULT_ALIAS_MAP,
-)
+from qz_providers.health import HealthTracker
+from qz_providers.keys import ApiKey, KeySource
 
 __all__ = [
-    "ModelCapability",
-    "ModelLifecycleState",
-    "ModelMetadata",
-    "ProviderInfo",
-    "ProviderError",
+    "ApiKey",
     "AuthenticationError",
-    "RateLimitError",
-    "TimeoutError",
-    "ServerError",
+    "CatalogError",
+    "ConnectionError",
     "ContextLengthExceededError",
-    "ModelNotFoundError",
-    "ModelUnavailableError",
+    "GatewayResponse",
+    "HealthTracker",
     "InvalidRequestError",
+    "KeySource",
+    "ModelGateway",
+    "ModelNotFoundError",
+    "ModelSpec",
+    "ModelUnavailableError",
+    "NoRouteError",
+    "ProviderCatalog",
+    "ProviderError",
+    "ProviderSpec",
+    "QuotaExhaustedError",
+    "RateLimitError",
+    "RouteInfo",
+    "ServerError",
+    "TimeoutError",
+    "get_gateway",
     "normalize_error",
-    "BaseProviderAdapter",
-    "OpenAICompatibleAdapter",
-    "GroqAdapter",
-    "MistralAdapter",
-    "GeminiAdapter",
-    "OpenRouterAdapter",
-    "DeepSeekAdapter",
-    "get_adapter_for_provider",
-    "register_adapter",
-    "ProviderRegistry",
-    "get_provider_registry",
-    "reset_provider_registry",
-    "ModelRegistry",
-    "get_model_registry",
-    "reset_model_registry",
-    "DEFAULT_ALIAS_MAP",
+    "parse_model_ref",
+    "reset_gateway",
+    "set_gateway",
 ]

@@ -8,9 +8,11 @@ import hashlib
 import os
 import re
 import shlex
-import shutil
 import subprocess
+
+from qz_sandbox.backend import NO_WINDOW
 import sys
+import threading
 from pathlib import Path
 
 from qz_environment import ProjectEnvironment, detect_project_environment
@@ -24,9 +26,17 @@ _PROJECT_PYTHON: str | None = None
 _FILE_SNAPSHOTS: dict[str, str] = {}
 _AGENT_CREATED_FILES: set[str] = set()
 _AGENT_COMMIT_HASHES: set[str] = set()
+# Original bytes of every file the agent modified since begin_change_tracking();
+# ``None`` means the agent created the file. Used to undo a failed subtask.
+_CHANGE_LOG: dict[str, bytes | None] | None = None
+_STATE_LOCK = threading.RLock()
+
+AGENT_COMMIT_TRAILER = "Committed-by: Qazterion"
+REDACTION_MARKER = "[REDACTED:"
 
 
-def _current_workspace() -> str:
+def current_workspace() -> str:
+    """The workspace of the active task (thread-bound context first, then WORKSPACE)."""
     try:
         from qz_core.common import get_task_context
         ctx = get_task_context()
@@ -35,6 +45,131 @@ def _current_workspace() -> str:
     except Exception:
         pass
     return WORKSPACE
+
+
+_current_workspace = current_workspace
+
+
+def reset_task_state() -> None:
+    """Forget per-task file snapshots so a new task starts from a clean slate."""
+    global _CHANGE_LOG
+    with _STATE_LOCK:
+        _FILE_SNAPSHOTS.clear()
+        _AGENT_CREATED_FILES.clear()
+        _CHANGE_LOG = None
+
+
+def begin_change_tracking() -> None:
+    global _CHANGE_LOG
+    with _STATE_LOCK:
+        _CHANGE_LOG = {}
+
+
+def _remember_original(full: str) -> None:
+    with _STATE_LOCK:
+        if _CHANGE_LOG is None or full in _CHANGE_LOG:
+            return
+        try:
+            with open(full, "rb") as handle:
+                _CHANGE_LOG[full] = handle.read()
+        except FileNotFoundError:
+            _CHANGE_LOG[full] = None
+        except OSError:
+            pass
+
+
+def restore_tracked_changes() -> tuple[list[str], list[str]]:
+    """Undo agent edits recorded since begin_change_tracking().
+
+    A file is restored only if it still holds exactly what the agent last wrote,
+    so edits made by the user meanwhile are never overwritten. Returns
+    ``(restored_paths, skipped_paths)`` relative to the workspace.
+    """
+    global _CHANGE_LOG
+    restored: list[str] = []
+    skipped: list[str] = []
+    workspace = Path(current_workspace()).resolve()
+    with _STATE_LOCK:
+        log = _CHANGE_LOG or {}
+        for full, original in log.items():
+            try:
+                rel = Path(full).resolve().relative_to(workspace).as_posix()
+            except ValueError:
+                rel = full
+            current = _file_sha256(full)
+            if current is not None and current != _FILE_SNAPSHOTS.get(full):
+                skipped.append(rel)
+                continue
+            try:
+                if original is None:
+                    if os.path.exists(full):
+                        os.remove(full)
+                    _FILE_SNAPSHOTS.pop(full, None)
+                    _AGENT_CREATED_FILES.discard(full)
+                else:
+                    with open(full, "wb") as handle:
+                        handle.write(original)
+                    _FILE_SNAPSHOTS[full] = hashlib.sha256(original).hexdigest()
+                restored.append(rel)
+            except OSError:
+                skipped.append(rel)
+        if _CHANGE_LOG is not None:
+            _CHANGE_LOG = {}
+    return restored, skipped
+
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def _decode(data: bytes) -> tuple[str, str]:
+    """Decode file bytes, returning ``(text, encoding)`` without losing bytes."""
+    if data.startswith(_UTF8_BOM):
+        try:
+            return data[3:].decode("utf-8"), "utf-8-sig"
+        except UnicodeDecodeError:
+            pass
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        # Legacy single-byte files: latin-1 maps every byte, so writing back with
+        # the same codec reproduces untouched bytes exactly.
+        return data.decode("latin-1"), "latin-1"
+
+
+def _encode(text: str, encoding: str) -> bytes:
+    if encoding == "utf-8-sig":
+        return _UTF8_BOM + text.encode("utf-8")
+    try:
+        return text.encode(encoding)
+    except UnicodeEncodeError:
+        return text.encode("utf-8")
+
+
+def _read_text_file(full: str) -> tuple[str, str, str]:
+    """Return ``(text_with_lf_newlines, encoding, newline_style)``."""
+    with open(full, "rb") as handle:
+        data = handle.read()
+    text, encoding = _decode(data)
+    newline = "\r\n" if "\r\n" in text else "\n"
+    return text.replace("\r\n", "\n"), encoding, newline
+
+
+def _write_text_file(full: str, text: str, encoding: str = "utf-8", newline: str = "\n") -> None:
+    normalized = text.replace("\r\n", "\n")
+    if newline != "\n":
+        normalized = normalized.replace("\n", newline)
+    with open(full, "wb") as handle:
+        handle.write(_encode(normalized, encoding))
+
+
+def _redaction_refusal(path: str, content: str) -> str | None:
+    if REDACTION_MARKER in content:
+        return (
+            f"Write refused: content for '{path}' contains a '{REDACTION_MARKER}...]' placeholder. "
+            "Secrets are masked in tool output; edit around them with apply_patch instead of "
+            "rewriting lines that contain them."
+        )
+    return None
 
 
 def _file_sha256(path: str) -> str | None:
@@ -125,12 +260,14 @@ def _impl_read_file(path: str, start_line: int | None = None, end_line: int | No
     full = _safe_path(path)
     if not os.path.exists(full):
         return f"File not found: {path}"
+    if os.path.isdir(full):
+        return f"'{path}' is a directory; use list_files."
     try:
-        with open(full, "r", errors="ignore") as f:
-            lines = f.readlines()
-        with open(full, "rb") as f_bytes:
-            _FILE_SNAPSHOTS[full] = hashlib.sha256(f_bytes.read()).hexdigest()
-    except Exception as e:
+        text, _encoding, _newline = _read_text_file(full)
+        lines = text.splitlines(keepends=True)
+        with _STATE_LOCK:
+            _FILE_SNAPSHOTS[full] = _file_sha256(full)
+    except OSError as e:
         return f"Error reading file {path}: {e}"
 
     total_lines = len(lines)
@@ -159,17 +296,28 @@ def write_file(path: str, content: str) -> str:
 
 def _impl_write_file(path: str, content: str) -> str:
     full = _safe_path(path)
+    content = str(content)
+    refusal = _redaction_refusal(path, content)
+    if refusal:
+        return refusal
     existed = os.path.exists(full)
     stale = _refuse_stale_write(full, path)
     if stale:
         return stale
+    encoding, newline = "utf-8", "\n"
+    if existed:
+        try:
+            _old_text, encoding, newline = _read_text_file(full)
+        except OSError:
+            pass
     if os.path.dirname(full):
         os.makedirs(os.path.dirname(full), exist_ok=True)
-    with open(full, "w", encoding="utf-8", newline="") as f:
-        f.write(content)
-    _FILE_SNAPSHOTS[full] = _file_sha256(full)
-    if not existed:
-        _AGENT_CREATED_FILES.add(full)
+    _remember_original(full)
+    _write_text_file(full, content, encoding, newline)
+    with _STATE_LOCK:
+        _FILE_SNAPSHOTS[full] = _file_sha256(full)
+        if not existed:
+            _AGENT_CREATED_FILES.add(full)
     return f"Written: {path} ({len(content)} chars)"
 
 
@@ -211,8 +359,7 @@ def _impl_read_relevant_chunks(query: str, limit: int = 3) -> str:
         rendered = []
         for chunk in chunks:
             full_path = _safe_path(chunk["path"])
-            with open(full_path, "r", errors="ignore") as source_file:
-                lines = source_file.readlines()
+            lines = _read_text_file(full_path)[0].splitlines(keepends=True)
             selected_lines = lines[chunk["start_line"] - 1:chunk["end_line"]]
             numbered = "".join(
                 f"{i:>5}\t{line}" for i, line in enumerate(selected_lines, start=chunk["start_line"])
@@ -227,8 +374,7 @@ def _impl_read_relevant_chunks(query: str, limit: int = 3) -> str:
 
 
 # ============================================================
-# PHASE 1: Diff-based edits
-# Dependency-free unified-diff parser + applier — koi extra
+# Diff-based edits
 # Dependency-free unified-diff parser and applier; no additional package is required.
 # ============================================================
 
@@ -304,7 +450,11 @@ def _apply_hunks(original_lines: list, hunks: list) -> list:
     for hunk in hunks:
         # Unified diff uses old_start=0 for an insertion into an empty file.
         # It maps to the first (0-indexed) position rather than -1.
-        pos = (0 if hunk["old_start"] == 0 else hunk["old_start"] - 1) + offset
+        # A pure insertion ("-N,0") goes *after* original line N.
+        if hunk["old_count"] == 0:
+            pos = hunk["old_start"] + offset
+        else:
+            pos = hunk["old_start"] - 1 + offset
         if pos < 0 or pos > len(result):
             raise ValueError(
                 f"Hunk line number ({hunk['old_start']}) is outside the file range. "
@@ -356,8 +506,8 @@ def _impl_apply_patch(path: str, diff: str) -> str:
 
         @@ -3,2 +3,3 @@
          unchanged context line
-        -purani line
-        +nayi line
+        -old line
+        +new line
         +another new line
     """
     full = _safe_path(path)
@@ -367,20 +517,29 @@ def _impl_apply_patch(path: str, diff: str) -> str:
     stale = _refuse_stale_write(full, path)
     if stale:
         return stale.replace("Write refused", "Patch refused", 1)
+    diff = str(diff).replace("\r\n", "\n")
+    added_text = "".join(line[1:] for line in diff.splitlines(keepends=True) if line.startswith("+"))
+    refusal = _redaction_refusal(path, added_text)
+    if refusal:
+        return refusal.replace("Write refused", "Patch refused", 1)
 
-    with open(full, "r", errors="ignore") as f:
-        original_lines = f.readlines()
+    text, encoding, newline = _read_text_file(full)
+    missing_final_newline = bool(text) and not text.endswith("\n")
+    original_lines = (text + "\n" if missing_final_newline else text).splitlines(keepends=True)
 
     try:
         hunks = _parse_hunks(diff)
         patched_lines = _apply_hunks(original_lines, hunks)
-    except Exception as e:
+    except ValueError as e:
         return f"Could not apply patch: {e}. Read the complete file again with read_file and create a correct diff."
 
-    with open(full, "w", encoding="utf-8", newline="") as f:
-        f.writelines(patched_lines)
-
-    _FILE_SNAPSHOTS[full] = _file_sha256(full)
+    patched_text = "".join(patched_lines)
+    if missing_final_newline and patched_lines and patched_lines[-1] == original_lines[-1]:
+        patched_text = patched_text[:-1]  # last line untouched: keep it without a newline
+    _remember_original(full)
+    _write_text_file(full, patched_text, encoding, newline)
+    with _STATE_LOCK:
+        _FILE_SNAPSHOTS[full] = _file_sha256(full)
     old_count, new_count = len(original_lines), len(patched_lines)
     return f"Patch applied: {path} ({old_count} → {new_count} lines)"
 
@@ -390,55 +549,41 @@ def run_command(command: str, timeout: int = 60) -> str:
 
 
 def _impl_run_command(command: str, timeout: int = 60) -> str:
-    """Run an agent command with the PowerShell semantics promised in the prompt.
+    """Run an agent command on the host, inside the workspace.
 
-    If ``python`` is missing from a fresh PowerShell PATH, use the interpreter
-    running Qazterion for a leading Python command.
-
-    On Windows this uses PowerShell, matching the prompt's promised semantics.
-    On Linux/macOS there is no ``powershell.exe`` available, so the command is
-    run through the platform's native shell instead.
+    Windows uses PowerShell (matching the system prompt); other platforms use
+    /bin/sh. A leading ``python`` is rewritten to the project's interpreter (or
+    the one running Qazterion) because a fresh shell's PATH often lacks it.
     """
+    try:
+        timeout = max(1, min(int(timeout), 300))
+    except (TypeError, ValueError):
+        return "Invalid timeout: it must be a whole number of seconds."
     try:
         if _PROJECT_PYTHON is None:
             configure_project_environment(_current_workspace())
-        timeout = max(1, min(int(timeout), 300))
         is_windows = os.name == "nt"
-        manager = get_manager()
-        using_docker = manager.docker_available
         workspace = _current_workspace()
-        # Host-python rewrite is only valid on the host backend. A Docker
-        # container has its own interpreter at /usr/local/bin/python.
-        if not using_docker:
-            if re.match(r"^\s*python(?:\.exe)?(?=\s|$)", command, re.IGNORECASE):
-                interpreter = _PROJECT_PYTHON or sys.executable
+        interpreter = _PROJECT_PYTHON or sys.executable
+        if re.match(r"^\s*python(?:\.exe)?(?=\s|$)", command, re.IGNORECASE):
+            if is_windows:
+                quoted = interpreter.replace("'", "''")
+                command = re.sub(r"^\s*python(?:\.exe)?", lambda _m: f"& '{quoted}'", command, count=1, flags=re.IGNORECASE)
             else:
-                interpreter = None
-            if interpreter:
-                if is_windows:
-                    quoted_interpreter = interpreter.replace("'", "''")
-                    command = re.sub(r"^\s*python(?:\.exe)?", lambda _match: f"& '{quoted_interpreter}'", command, count=1, flags=re.IGNORECASE)
-                else:
-                    quoted_interpreter = shlex.quote(interpreter)
-                    command = re.sub(r"^\s*python(?:\.exe)?", lambda _match: quoted_interpreter, command, count=1, flags=re.IGNORECASE)
+                command = re.sub(r"^\s*python(?:\.exe)?", lambda _m: shlex.quote(interpreter), command, count=1, flags=re.IGNORECASE)
+        manager = get_manager()
         result = manager.execute(command, workspace, timeout)
         if result.timed_out:
             return f"Command did not complete within {timeout}s (timeout)."
-        if result.error and not result.timed_out and result.exit_code == -1 and not result.stdout and not result.stderr:
+        if result.error and result.exit_code == -1 and not result.stdout and not result.stderr:
             return f"Could not start command: {result.error}"
         # Python 3.14 made ``unittest discover -s tests`` require an
-        # ``__init__.py`` in the start directory.  That breaks the very common
-        # flat ``tests/`` layout supported by prior Python versions.  Preserve
-        # the user's source tree and retry only this known compatibility case
-        # with an in-memory module loader.
-        start_directory = re.search(
-            r"-m\s+unittest\s+discover\s+-s\s+([\w./\\-]+)\s*$",
-            command,
-            re.IGNORECASE,
-        )
+        # ``__init__.py`` in the start directory. Retry that one known case with
+        # an in-memory loader instead of changing the user's source tree.
+        start_directory = re.search(r"-m\s+unittest\s+discover\s+-s\s+([\w./\\-]+)\s*$", command, re.IGNORECASE)
         if result.exit_code and start_directory and "Start directory is not importable" in result.stderr:
             tests_path = start_directory.group(1)
-            compatibility_runner = (
+            runner = (
                 "import importlib.util, pathlib, sys, unittest; "
                 "sys.path.insert(0, str(pathlib.Path('.').resolve())); "
                 f"root = pathlib.Path(r'{tests_path}'); "
@@ -448,38 +593,19 @@ def _impl_run_command(command: str, timeout: int = 60) -> str:
                 "outcome = unittest.TextTestRunner(verbosity=1).run(suite); "
                 "raise SystemExit(not outcome.wasSuccessful())"
             )
-            if using_docker:
-                retry_command = "python -c " + shlex.quote(compatibility_runner)
-            elif is_windows:
-                quoted_interpreter = (_PROJECT_PYTHON or sys.executable).replace("'", "''")
-                quoted_script = compatibility_runner.replace("'", "''")
-                retry_command = f"& '{quoted_interpreter}' -c '{quoted_script}'"
+            if is_windows:
+                retry = f"& '{interpreter.replace(chr(39), chr(39) * 2)}' -c '{runner.replace(chr(39), chr(39) * 2)}'"
             else:
-                retry_command = f"{shlex.quote(_PROJECT_PYTHON or sys.executable)} -c {shlex.quote(compatibility_runner)}"
-            result = manager.execute(retry_command, workspace, timeout)
+                retry = f"{shlex.quote(interpreter)} -c {shlex.quote(runner)}"
+            result = manager.execute(retry, workspace, timeout)
             if result.timed_out:
                 return f"Command did not complete within {timeout}s (timeout)."
-            if result.error and not result.timed_out and result.exit_code == -1 and not result.stdout and not result.stderr:
-                return f"Could not start command: {result.error}"
-        isolation_tag = f"[ISOLATION: {result.isolation or ('docker' if using_docker else 'UNSANDBOXED')}"
-        if result.fallback_reason:
-            isolation_tag += f" ({result.fallback_reason})"
-        isolation_tag += "]"
 
-        if result.isolation == "DENIED" or (result.error and str(result.error).startswith("ISOLATION_DENIED")):
-            return (
-                f"exit_code={result.exit_code}\n{isolation_tag}\n"
-                f"Command refused: isolation is unavailable or incomplete. "
-                f"{result.error or result.stderr or 'Sandbox required.'}\n"
-            )
-
-        output = f"exit_code={result.exit_code}\n{isolation_tag}\n"
+        output = f"exit_code={result.exit_code}\n"
         output += f"STDOUT:\n{result.stdout[-3000:]}\n"
         if result.stderr:
             output += f"STDERR:\n{result.stderr[-3000:]}\n"
         return output
-    except (TypeError, ValueError):
-        return "Invalid timeout: it must be a whole number of seconds."
     except OSError as e:
         return f"Could not start command: {e}"
 
@@ -498,6 +624,8 @@ def _run_git(args: list[str]) -> subprocess.CompletedProcess:
         errors="replace",
         check=False,
         env=sanitize_subprocess_env(_current_workspace()),
+        stdin=subprocess.DEVNULL,
+        creationflags=NO_WINDOW,
     )
 
 
@@ -518,6 +646,12 @@ def ensure_git_repository() -> str:
 
     initialized_here = inside.returncode != 0
     if initialized_here:
+        workspace = Path(_current_workspace()).resolve()
+        if workspace == Path.home().resolve() or workspace.parent == workspace:
+            return (
+                "Git unavailable: refusing to create a repository in your home directory or a drive root. "
+                "Open a project folder instead."
+            )
         initialized = _run_git(["init"])
         if initialized.returncode != 0:
             return f"Git init failed: {_git_error(initialized)}"
@@ -594,7 +728,7 @@ def commit_changes(paths: list[str], message: str) -> str:
         return f"Git status check failed: {_git_error(staged)}"
 
     normalized_message = " ".join(str(message).split())[:120] or "Update project files"
-    committed = _run_git(["commit", "-m", normalized_message])
+    committed = _run_git(["commit", "-m", normalized_message, "-m", AGENT_COMMIT_TRAILER])
     if committed.returncode != 0:
         return f"Git commit failed: {_git_error(committed)}"
     commit_id = _run_git(["rev-parse", "--short", "HEAD"])
@@ -603,6 +737,15 @@ def commit_changes(paths: list[str], message: str) -> str:
         _AGENT_COMMIT_HASHES.add(full_hash.stdout.strip())
         _AGENT_COMMIT_HASHES.add(commit_id.stdout.strip())
     return f"Git commit created: {commit_id.stdout.strip()} — {normalized_message}"
+
+
+def is_agent_commit(commit: str) -> bool:
+    """True if ``commit`` carries Qazterion's trailer (or the legacy agent author name)."""
+    body = _run_git(["log", "-1", "--format=%an%n%B", commit])
+    if body.returncode != 0:
+        return False
+    lines = body.stdout.splitlines()
+    return bool(lines) and (lines[0].strip() == "Qazterion Agent" or AGENT_COMMIT_TRAILER in body.stdout)
 
 
 def rollback_last_change() -> str:
@@ -620,7 +763,7 @@ def _impl_rollback_last_change() -> str:
     if ready.startswith(("Git unavailable", "Git init failed", "Git identity setup failed")):
         return ready
 
-    status = _run_git(["status", "--porcelain"])
+    status = _run_git(["status", "--porcelain", "--untracked-files=no"])
     if status.returncode != 0:
         return f"Git status check failed: {_git_error(status)}"
     if status.stdout.strip():
@@ -634,12 +777,8 @@ def _impl_rollback_last_change() -> str:
     if current.returncode != 0 or not current.stdout.strip():
         return "Rollback refused: current HEAD could not be determined."
     head_hash = current.stdout.strip()
-    is_agent_commit = head_hash in _AGENT_COMMIT_HASHES or head_hash[:7] in _AGENT_COMMIT_HASHES
-    if not is_agent_commit:
-        author_check = _run_git(["log", "-1", "--format=%an", "HEAD"])
-        author = author_check.stdout.strip() if author_check.returncode == 0 else ""
-        if author != "Qazterion Agent":
-            return "Rollback refused: latest commit was not created by Qazterion Agent."
+    if not (head_hash in _AGENT_COMMIT_HASHES or is_agent_commit(head_hash)):
+        return "Rollback refused: latest commit was not created by Qazterion Agent."
 
     anc = _run_git(["merge-base", "--is-ancestor", "HEAD~1", "HEAD"])
     if anc.returncode != 0:
@@ -700,10 +839,14 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the complete contents of a file.",
+            "description": "Read a file with 1-based line numbers. Pass start_line/end_line to read part of a large file.",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                },
                 "required": ["path"],
             },
         },
@@ -765,7 +908,10 @@ TOOL_SCHEMAS = [
             "description": "Run a terminal command in the current project directory.",
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string"}},
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer", "description": "Seconds (default 60, max 300)"},
+                },
                 "required": ["command"],
             },
         },
@@ -775,8 +921,8 @@ TOOL_SCHEMAS = [
         "function": {
             "name": "rollback_last_change",
             "description": (
-                "Latest automatic Git commit ko rollback karta hai. Sirf tab use karo jab user ne explicitly "
-                "latest agent change undo karne ko kaha ho. Uncommitted changes hon to safety ke liye refuse karega."
+                "Undo the latest automatic Qazterion commit. Use only when the user explicitly asks to "
+                "undo the latest agent change. Refuses when there are uncommitted changes."
             ),
             "parameters": {"type": "object", "properties": {}},
         },

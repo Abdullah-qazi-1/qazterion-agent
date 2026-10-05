@@ -1,82 +1,80 @@
-"""Abstract Base Class for LLM Provider Adapters."""
+"""Provider adapter interface.
+
+An adapter knows how to talk to one provider *type* (wire protocol). It holds no
+keys and no routing logic: the gateway passes the key for every call and
+decides what to do with failures.
+"""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Iterator
+from typing import Any
 
-from qz_providers.exceptions import ProviderError, normalize_error
-from qz_providers.models import ModelMetadata, ProviderInfo
+from qz_providers.catalog import ProviderSpec
 
 
-class BaseProviderAdapter(ABC):
-    """Abstract interface that all provider adapters must implement."""
+def sanitize_messages(messages: list[dict]) -> list[dict]:
+    """Normalize a chat history so strict providers (e.g. Gemini) accept it.
 
-    provider_id: str
-    display_name: str
-    base_url: str | None = None
-    default_concurrency: int = 2
+    * a ``system`` message after the first turn becomes a user note;
+    * ``content`` is always a string (``""`` when an assistant turn only has tool calls);
+    * tool responses always carry a ``tool_call_id``.
+    """
+    clean: list[dict] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role", "user")
+        content = message.get("content")
+        if role == "system" and clean:
+            role, content = "user", f"[System Note]: {content}"
+        entry: dict[str, Any] = {"role": role}
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            entry["tool_calls"] = tool_calls
+        if content is not None:
+            entry["content"] = content if isinstance(content, (str, list)) else str(content)
+        else:
+            entry["content"] = ""
+        if role == "tool":
+            entry["tool_call_id"] = str(message.get("tool_call_id") or "call_0")
+        if message.get("name") and role != "tool":
+            entry["name"] = message["name"]
+        clean.append(entry)
+    return clean
+
+
+class ProviderAdapter(ABC):
+    """Base class for provider wire-protocol adapters."""
+
+    def __init__(self, spec: ProviderSpec) -> None:
+        self.spec = spec
+
+    @property
+    def provider_id(self) -> str:
+        return self.spec.provider_id
 
     @abstractmethod
     def complete(
         self,
         *,
-        messages: list[dict[str, Any]],
-        model: str,
         api_key: str,
-        tools: list[dict[str, Any]] | None = None,
-        temperature: float = 0.2,
+        model: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
         max_tokens: int | None = None,
-        **kwargs: Any,
+        timeout: float = 60.0,
     ) -> Any:
-        """Execute a non-streaming chat completion."""
-        ...
-
-    def stream_complete(
-        self,
-        *,
-        messages: list[dict[str, Any]],
-        model: str,
-        api_key: str,
-        tools: list[dict[str, Any]] | None = None,
-        temperature: float = 0.2,
-        max_tokens: int | None = None,
-        **kwargs: Any,
-    ) -> Iterator[Any]:
-        """Execute a streaming chat completion. Default implementation raises or falls back."""
-        raise NotImplementedError(f"Streaming is not implemented for provider '{self.provider_id}'")
+        """Return an OpenAI-style chat completion or raise ``ProviderError``."""
 
     @abstractmethod
-    def get_static_models(self) -> list[ModelMetadata]:
-        """Return hardcoded/default models catalog with rich capability metadata."""
-        ...
+    def list_models(self, *, api_key: str, timeout: float = 10.0) -> list[dict[str, Any]]:
+        """Return ``[{"id": ..., "context_window": ..., "tools": ...}, ...]`` or raise ``ProviderError``."""
 
-    def discover_models(self, api_key: str | None = None) -> list[ModelMetadata]:
-        """Discover live models from provider endpoint. Falls back to static catalog if discovery fails."""
-        return self.get_static_models()
+    def check_key(self, *, api_key: str, timeout: float = 10.0) -> int:
+        """Validate a key cheaply. Returns the number of models visible; raises ``ProviderError``."""
+        return len(self.list_models(api_key=api_key, timeout=timeout))
 
-    def check_health(self, api_key: str | None = None) -> dict[str, Any]:
-        """Health/readiness check for provider. Returns status dict."""
-        return {
-            "provider": self.provider_id,
-            "status": "configured" if api_key else "unconfigured",
-            "base_url": self.base_url,
-        }
-
-    def normalize_error(self, error: Exception | str | None, status_code: int | None = None) -> ProviderError:
-        """Normalize an adapter-specific error into standard ProviderError."""
-        return normalize_error(error, status_code)
-
-    def get_provider_info(self, enabled: bool = True) -> ProviderInfo:
-        """Return descriptor of this provider and its capabilities."""
-        static_models = [m.model_id for m in self.get_static_models()]
-        return ProviderInfo(
-            provider_id=self.provider_id,
-            display_name=self.display_name,
-            enabled=enabled,
-            adapter_type=self.__class__.__name__,
-            base_url=self.base_url,
-            default_concurrency=self.default_concurrency,
-            supported_capabilities=["chat", "streaming", "tool_calling"],
-            models=static_models,
-        )
+    def close(self) -> None:
+        """Release network resources (connection pools)."""

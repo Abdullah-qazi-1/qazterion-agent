@@ -100,13 +100,14 @@ class ValidationPipeline:
         changes: list[dict] | None = None,
         test_command: str | None = None,
         client: OpenAI | None = None,
+        test_baseline: Any | None = None,
     ) -> ValidationReport:
         """Run all applicable validation checks and compile a structured report."""
         checks: dict[str, CheckResult] = {}
 
         # 1. Tests Check (Required by default)
         is_tests_req = "tests" in self.required_checks
-        test_res = run_tests(workspace, command=test_command, is_required=is_tests_req)
+        test_res = run_tests(workspace, command=test_command, is_required=is_tests_req, baseline=test_baseline)
         checks["tests"] = test_res
         _persist_event(task_id, "VALIDATION_CHECK", test_res.to_dict())
 
@@ -136,11 +137,21 @@ class ValidationPipeline:
 
         # 6. Requirements / Self-Review Check (Advisory by default)
         is_req_req = "requirements" in self.required_checks
-        if changes:
+        # The advisory self-review costs a model call; skip it when tests already
+        # failed, because the repair loop will run again anyway.
+        tests_failed = test_res.status in (CheckStatus.FAIL, CheckStatus.ERROR)
+        if changes and tests_failed and not is_req_req:
+            req_res = CheckResult(
+                name="requirements",
+                status=CheckStatus.SKIPPED,
+                summary="Self-review skipped because tests failed.",
+                is_required=False,
+            )
+        elif changes:
             try:
                 from qz_core.reviewer import self_review
                 findings = self_review(changes, client=client)
-            except Exception as e:
+            except Exception:
                 findings = None
             if findings:
                 req_res = CheckResult(

@@ -1,4 +1,10 @@
-"""Keyword/pattern risk classification for agent shell commands."""
+"""Keyword/pattern risk classification for agent shell commands.
+
+LOW runs, MEDIUM needs the user's approval, HIGH and FORBIDDEN are refused.
+This is a guard-rail against destructive or exfiltrating *commands*; code that
+the agent writes into the workspace and then runs is reviewed by the user
+through the plan/diff workflow, not by these patterns.
+"""
 
 from __future__ import annotations
 
@@ -39,29 +45,50 @@ _HIGH: tuple[tuple[str, str], ...] = (
     (r"\b(bitsadmin|certutil)\b", "transfer/living-off-the-land"),
     (r"\breg\s+(add|query|export)\b", "registry access"),
     (r"hk(lm|cu|cr|u)\\|\\currentversion\\run", "registry run keys"),
-    (r"\.ssh\\|\\appdata\\|\\\.aws\\|\\\.gnupg\\|\bcredentials\b|\.env\b", "credential path"),
-    (r"\$env:userprofile|ntuser\.dat|\bSAM\b|unattend\.xml", "credential/store path"),
+    (r"\.ssh[\\/]|[\\/]appdata[\\/]|[\\/]\.aws[\\/]|[\\/]\.gnupg[\\/]|\bcredentials\b|(?<![\w.-])\.env\b", "credential path"),
+    (r"\$env:userprofile|\$home\b|~[\\/]|ntuser\.dat|\bSAM\b|unattend\.xml", "credential/store path"),
     (r"\b(cmdkey|whoami\s+/priv|procdump)\b", "credential/privilege probe"),
     (r"\b(icacls|takeown)\b", "acl takeover"),
     (r"start-process[^\n]*-verb\s+runas", "elevation"),
     (r"\bnetsh\b", "network stack change"),
     (r"\b(rundll32|regsvr32|mshta|wscript|cscript)\b", "script host"),
-    (r"\b(python\d*|py|pythonw)(?:\.exe)?\s+([^\n]*\s)?(-c|--command|-m\s+(?!pytest\b|unittest\b|pip\b|venv\b))\b", "inline python execution"),
-    (r"\b(node|nodejs|deno|bun)(?:\.exe)?\s+([^\n]*\s)?(-e|--eval|-p|--print)\b", "inline js/ts execution"),
-    (r"\b(perl|ruby|php|lua|tclsh|osascript|groovy|scala|julia|erl|elixir)\b", "unrestricted interpreter execution"),
-    (r"\b(bash|sh|zsh|ksh|csh|dash)(?:\.exe)?\s+([^\n]*\s)?(-c)\b", "inline shell execution"),
+    # Git operations that destroy uncommitted work or rewrite history.
+    (r"\bgit\s+reset\s+--(hard|merge|keep)\b", "git reset discards work"),
+    (r"\bgit\s+clean\b[^\n]*\s-[a-zA-Z]*[fdxX]", "git clean deletes untracked files"),
+    (r"\bgit\s+checkout\s+(?:\S+\s+)?--\s+\S|\bgit\s+checkout\s+(?:-f|--force)\b|\bgit\s+checkout\s+\.(?:\s|$)",
+     "git checkout discards changes"),
+    (r"\bgit\s+restore\b(?![^\n]*--staged\b)", "git restore discards changes"),
+    (r"\bgit\s+stash\s+(drop|clear)\b", "git stash deletion"),
+    (r"\bgit\s+branch\s+(-D\b|--delete\s+--force\b)", "git branch force-delete"),
+    (r"\bgit\s+push\b[^\n]*(--force|\s-f\b|\s\+\S)", "git force push"),
+    (r"\bgit\s+(rebase|filter-branch|filter-repo|update-ref\s+-d|reflog\s+expire|gc\s+--prune)\b", "git history rewrite"),
+    # Nested shells / script hosts hide the real command from these checks.
+    (r"\b(perl|ruby|php|lua|tclsh|osascript)\b\s+-[a-zA-Z]*e\b", "inline script execution"),
+    (r"\b(bash|sh|zsh|ksh|csh|dash)(?:\.exe)?\s+([^\n]*\s)?(-c)\b", "nested shell invocation"),
     (r"\b(powershell|pwsh|cmd)(?:\.exe)?\s+([^\n]*\s)?(-c|-command|/c|/k)\b", "nested shell invocation"),
-    (r"\b(urllib|requests|socket|http\.client|aiohttp|httpx)\b", "network socket/http access"),
-    (r"\bshutil\.(rmtree|move|copy)\b|\bos\.(remove|unlink|rmdir|system|popen)\b", "interpreter filesystem/process mutation"),
-    (r"\b(eval|exec)\s*\(|\b__import__\b|\bsubprocess\.(Popen|run|call|check_call|check_output)\b", "dynamic code execution"),
 )
 
 _MEDIUM: tuple[tuple[str, str], ...] = (
-    (r"\b(pip|pip3|uv)\s+install\b|\bnpm\s+install\b|\bpnpm\s+install\b|\byarn\s+add\b", "package install"),
-    (r"\bgit\s+(clone|push|filter-branch|filter-repo)\b", "git network/history rewrite"),
+    (r"\b(pip|pip3|uv)\s+install\b|\bnpm\s+(install|i|ci)\b|\bpnpm\s+(install|add)\b|\byarn\s+add\b", "package install"),
+    (r"\bgit\s+(clone|push|pull|fetch)\b", "git network access"),
     (r"\b(move-item|copy-item|rename-item)\b", "filesystem move/copy"),
     (r"\b(chmod|chown|attrib)\b", "permission change"),
     (r"\bstart-process\b", "new process"),
+)
+
+# Inline interpreter code (python -c / node -e) is judged by what it does:
+# computation and assertions are fine; network, process spawning or deletion
+# inside a one-liner is not.
+_INLINE_CODE = re.compile(
+    r"\b(?:python\d*(?:\.\d+)?|py|pythonw)(?:\.exe)?['\"]?\s+(?:[^\n]*\s)?(?:-c|--command)\b"
+    r"|\b(?:node|nodejs|deno|bun)(?:\.exe)?\s+(?:[^\n]*\s)?(?:-e|--eval|-p|--print)\b",
+    re.IGNORECASE,
+)
+_INLINE_DANGER: tuple[tuple[str, str], ...] = (
+    (r"\b(urllib|requests|socket|http\.client|aiohttp|httpx|child_process)\b|\bfetch\(", "network/process access in inline code"),
+    (r"\bshutil\.(rmtree|move)\b|\bos\.(remove|unlink|rmdir|removedirs|system|popen)\b|\bfs\.(rm|rmSync|unlink)",
+     "file deletion or shell call in inline code"),
+    (r"\b(eval|exec)\s*\(|\b__import__\b|\bsubprocess\b", "dynamic code execution in inline code"),
 )
 
 _COMPILED = [
@@ -69,35 +96,21 @@ _COMPILED = [
     (RiskLevel.HIGH, [(re.compile(p, re.IGNORECASE), r) for p, r in _HIGH]),
     (RiskLevel.MEDIUM, [(re.compile(p, re.IGNORECASE), r) for p, r in _MEDIUM]),
 ]
-
-
-_INTERPRETER_REASON_MARKERS = (
-    "inline python",
-    "inline js/ts",
-    "unrestricted interpreter",
-    "inline shell",
-    "nested shell",
-    "dynamic code",
-    "script host",
-)
+_COMPILED_INLINE = [(re.compile(p, re.IGNORECASE), r) for p, r in _INLINE_DANGER]
 
 
 def classify_command(command: str) -> tuple[RiskLevel, list[str]]:
     """Return the highest matching risk level and human-readable reasons."""
     text = command or ""
-    reasons: list[str] = []
-    level = RiskLevel.LOW
-    for candidate, patterns in _COMPILED:
+    for level, patterns in _COMPILED:
         matched = [reason for regex, reason in patterns if regex.search(text)]
+        if level is RiskLevel.HIGH and _INLINE_CODE.search(text):
+            matched += [reason for regex, reason in _COMPILED_INLINE if regex.search(text)]
         if matched:
-            level = candidate
-            reasons = matched
-            break
-    return level, reasons
+            return level, matched
+    return RiskLevel.LOW, []
 
 
 def invokes_unrestricted_interpreter(command: str) -> bool:
-    """True when the command can run attacker-controlled code in an interpreter."""
-    _level, reasons = classify_command(command)
-    lowered = [r.lower() for r in reasons]
-    return any(any(marker in reason for marker in _INTERPRETER_REASON_MARKERS) for reason in lowered)
+    """True when the command runs inline interpreter code (python -c, node -e, ...)."""
+    return bool(_INLINE_CODE.search(command or ""))

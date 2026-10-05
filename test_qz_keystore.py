@@ -21,6 +21,10 @@ class MaskKeyTests(unittest.TestCase):
         self.assertEqual(mask_key(""), "(not set)")
 
 
+def _enabled(store):
+    return [e.env_name for e in store.list_entries() if e.enabled]
+
+
 class KeyStoreTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -40,32 +44,26 @@ class KeyStoreTests(unittest.TestCase):
 
     def test_unsupported_provider_raises_clear_error(self):
         with self.assertRaises(UnsupportedProviderError) as ctx:
-            self.store.set_key("openai", 1, "sk-whatever")
-        self.assertIn("Unsupported provider", str(ctx.exception))
+            self.store.set_key("not-a-provider", 1, "sk-whatever")
+        self.assertIn("Unknown provider", str(ctx.exception))
         self.assertIn("groq", str(ctx.exception))
 
     def test_multiple_keys_expand_into_sorted_env_group(self):
         self.store.set_key("groq", 1, "one")
         self.store.set_key("groq", 2, "two")
-        groups = self.store.enabled_key_groups()
-        self.assertEqual(groups["GROQ_KEY"], ["GROQ_KEY_1", "GROQ_KEY_2"])
+        self.assertEqual(_enabled(self.store), ["GROQ_KEY_1", "GROQ_KEY_2"])
 
     def test_disabled_key_is_excluded_from_groups_and_env(self):
         self.store.set_key("groq", 1, "one")
         self.store.set_key("groq", 2, "two", enabled=False)
-        groups = self.store.enabled_key_groups()
-        self.assertEqual(groups["GROQ_KEY"], ["GROQ_KEY_1"])
-        env = self.store.enabled_env()
-        self.assertIn("GROQ_KEY_1", env)
-        self.assertNotIn("GROQ_KEY_2", env)
+        self.assertEqual(_enabled(self.store), ["GROQ_KEY_1"])
+        self.assertEqual(self.store.get_key("groq", 2), "two")
 
     def test_stored_file_never_contains_plaintext_key(self):
         secret = "sk-super-secret-value-12345"
         self.store.set_key("mistral", 1, secret)
-        self.store.set_master_key("master-secret-value")
         raw = self.path.read_text(encoding="utf-8")
         self.assertNotIn(secret, raw)
-        self.assertNotIn("master-secret-value", raw)
 
     def test_masking_in_list_entries_never_reveals_full_value(self):
         secret = "sk-abcdefghijklmno"
@@ -77,15 +75,13 @@ class KeyStoreTests(unittest.TestCase):
 
     def test_reloading_the_store_reads_back_the_same_decrypted_value(self):
         self.store.set_key("gemini", 1, "reload-me")
-        self.store.set_master_key("master-reload")
         reloaded = KeyStore(path=self.path, backend="fernet")
         self.assertEqual(reloaded.get_key("gemini", 1), "reload-me")
-        self.assertEqual(reloaded.get_master_key(), "master-reload")
 
     def test_delete_key_removes_it_from_groups(self):
         self.store.set_key("groq", 1, "one")
         self.assertTrue(self.store.delete_key("groq", 1))
-        self.assertEqual(self.store.enabled_key_groups(), {})
+        self.assertEqual(_enabled(self.store), [])
         self.assertFalse(self.store.delete_key("groq", 1))
 
     def test_upgrade_style_reload_preserves_existing_keys_after_adding_a_new_one(self):
@@ -93,7 +89,7 @@ class KeyStoreTests(unittest.TestCase):
         # Simulate an app upgrade: a new KeyStore instance opens the same file.
         reopened = KeyStore(path=self.path, backend="fernet")
         reopened.set_key("groq", 2, "two")
-        self.assertEqual(reopened.enabled_key_groups()["GROQ_KEY"], ["GROQ_KEY_1", "GROQ_KEY_2"])
+        self.assertEqual(_enabled(reopened), ["GROQ_KEY_1", "GROQ_KEY_2"])
         self.assertEqual(reopened.get_key("groq", 1), "one")
 
     def test_backend_name_reports_fallback(self):
@@ -122,17 +118,14 @@ class KeyStoreTests(unittest.TestCase):
         dpapi_store = KeyStore(path=dpapi_path, backend="dpapi")
         self.assertEqual(dpapi_store.backend_name(), "dpapi")
         dpapi_store.set_key("groq", 1, "gsk_test_12345678")
-        dpapi_store.set_master_key("master_secret_dpapi")
         
         # Verify encrypted on disk
         raw_text = dpapi_path.read_text(encoding="utf-8")
         self.assertNotIn("gsk_test_12345678", raw_text)
-        self.assertNotIn("master_secret_dpapi", raw_text)
 
         # Reopen with fresh KeyStore instance (simulating app restart)
         reopened = KeyStore(path=dpapi_path, backend="dpapi")
         self.assertEqual(reopened.get_key("groq", 1), "gsk_test_12345678")
-        self.assertEqual(reopened.get_master_key(), "master_secret_dpapi")
 
 
 if __name__ == "__main__":

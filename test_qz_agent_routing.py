@@ -10,69 +10,48 @@ from qz_usage_tracker import UsageTracker
 
 
 def completion(content="done"):
-    return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=[]))]
-    )
+    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=[]))])
 
 
 class AgentRoutingTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.tracker = UsageTracker(log_path=None, cooldown_seconds=60)
+        self.tracker = UsageTracker(log_path=None)
 
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_successful_request_is_recorded(self):
-        with patch.object(qz_agent.client.chat.completions, "create", return_value=completion()):
-            response, active = qz_agent.request_completion(
-                model="groq-fast", messages=[], usage_tracker=self.tracker
-            )
-        self.assertEqual(active, "groq-fast")
+    def test_successful_request_returns_the_requested_role(self):
+        with patch.object(qz_agent.client.chat.completions, "create", return_value=completion()) as create:
+            response, active = qz_agent.request_completion(model="coder", messages=[], usage_tracker=self.tracker)
+        self.assertEqual(active, "coder")
         self.assertEqual(response.choices[0].message.content, "done")
-        self.assertEqual(self.tracker.summary()["request_count"], 1)
+        self.assertEqual(create.call_args.kwargs["model"], "coder")
 
-    def test_rate_limit_marks_alias_and_falls_back(self):
+    def test_role_fallback_only_after_the_whole_role_failed(self):
         with patch.object(
-            qz_agent.client.chat.completions,
-            "create",
-            side_effect=[RuntimeError("429 rate limit"), completion()],
+            qz_agent.client.chat.completions, "create",
+            side_effect=[RuntimeError("All models for 'coder' failed"), completion()],
         ) as create:
             _, active = qz_agent.request_completion(
-                model="groq-fast",
-                messages=[],
-                fallbacks=("groq-fast", "coder-backup"),
-                usage_tracker=self.tracker,
+                model="coder", messages=[], fallbacks=("reasoner",), usage_tracker=self.tracker,
             )
-        self.assertEqual(active, "coder-backup")
-        self.assertFalse(self.tracker.is_key_eligible("groq-fast"))
-        self.assertEqual([call.kwargs["model"] for call in create.call_args_list],
-                         ["groq-fast", "coder-backup"])
+        self.assertEqual(active, "reasoner")
+        self.assertEqual([c.kwargs["model"] for c in create.call_args_list], ["coder", "reasoner"])
 
-    def test_quota_error_is_classified_separately(self):
-        with patch.object(
-            qz_agent.client.chat.completions,
-            "create",
-            side_effect=[RuntimeError("insufficient quota"), RuntimeError("insufficient quota")],
-        ):
-            with self.assertRaises(RuntimeError):
-                qz_agent.request_completion(model="groq-fast", messages=[], usage_tracker=self.tracker)
-        self.assertEqual(self.tracker.summary()["flagged_keys"]["groq-fast"]["reason"], "quota_exhausted")
+    def test_empty_assistant_message_counts_as_failure(self):
+        empty = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="", tool_calls=[]))])
+        with patch.object(qz_agent.client.chat.completions, "create", return_value=empty):
+            with self.assertRaises(RuntimeError) as ctx:
+                qz_agent.request_completion(model="coder", messages=[], usage_tracker=self.tracker)
+        self.assertIn("empty assistant message", str(ctx.exception))
 
-    def test_flagged_alias_is_last_resort_and_success_clears_it(self):
-        self.tracker.mark_rate_limited("groq-fast")
-        with patch.object(qz_agent.client.chat.completions, "create", return_value=completion()) as create:
-            _, active = qz_agent.request_completion(
-                model="groq-fast",
-                messages=[],
-                fallbacks=("groq-fast", "coder-backup"),
-                usage_tracker=self.tracker,
-            )
-        self.assertEqual(active, "coder-backup")
-        self.assertEqual(create.call_args.kwargs["model"], "coder-backup")
-        with patch.object(qz_agent.client.chat.completions, "create", return_value=completion()):
-            qz_agent.request_completion(model="groq-fast", messages=[], usage_tracker=self.tracker)
-        self.assertTrue(self.tracker.is_key_eligible("groq-fast"))
+    def test_error_messages_are_redacted(self):
+        with patch.object(qz_agent.client.chat.completions, "create",
+                          side_effect=RuntimeError("bad key gsk_abcdefghijklmnopqrstuvwxyz123456")):
+            with self.assertRaises(RuntimeError) as ctx:
+                qz_agent.request_completion(model="coder", messages=[], usage_tracker=self.tracker)
+        self.assertNotIn("gsk_abcdefghijklmnopqrstuvwxyz123456", str(ctx.exception))
 
     def test_baseline_failure_is_captured_and_cancellation_is_clean(self):
         environment = ProjectEnvironment(

@@ -1,23 +1,10 @@
-# Core LLM Proxy & Client Orchestration
-litellm[proxy]>=1.40.0
-openai>=1.20.0
-PyYAML>=6.0.0
+# Runtime (keep in sync with pyproject.toml [project].dependencies)
+openai>=1.40.0          # HTTP client for every OpenAI-compatible provider API
+PyYAML>=6.0             # provider catalog (providers.yaml)
+cryptography>=41.0.0    # keystore encryption fallback on non-Windows
+rich>=13.0.0            # CLI rendering
+prompt_toolkit>=3.0.0   # CLI line editing / history
+python-dotenv>=1.0.0    # optional .env key loading
 
-# Keystore Encryption & Secret Security
-cryptography>=41.0.0
-
-# Optional Environment Configuration
-python-dotenv>=1.0.0
-
-# Optional Semantic Codebase Embeddings (Lexical & AST indexing is built-in)
-# sentence-transformers>=2.2.0
-
-# Testing & Quality Assurance
+# Development
 pytest>=7.0.0
-pytest-asyncio>=0.21.0
-
-# CLI Interface & Rich Terminal
-rich>=13.0.0
-prompt_toolkit>=3.0.0
-
-pyinstaller

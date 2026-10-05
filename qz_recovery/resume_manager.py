@@ -8,14 +8,16 @@ from pathlib import Path
 from typing import Any
 
 import subprocess
+
+from qz_sandbox.backend import NO_WINDOW
 from qz_sandbox.backend import sanitize_subprocess_env
 from qz_tasks import SubtaskStatus, TaskStatus, get_manager
-from qz_tools import WORKSPACE
+from qz_tools import current_workspace
 
 
 def get_current_head(workspace: str | Path | None = None) -> str | None:
     """Return the current short or full git HEAD commit hash, or None if unavailable."""
-    ws = Path(workspace or WORKSPACE).resolve()
+    ws = Path(workspace or current_workspace()).resolve()
     try:
         res = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -25,6 +27,8 @@ def get_current_head(workspace: str | Path | None = None) -> str | None:
             errors="replace",
             check=False,
             env=sanitize_subprocess_env(str(ws)),
+            stdin=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
         )
         if res.returncode == 0 and res.stdout.strip():
             return res.stdout.strip()
@@ -34,17 +38,23 @@ def get_current_head(workspace: str | Path | None = None) -> str | None:
 
 
 def get_uncommitted_files(workspace: str | Path | None = None) -> list[str]:
-    """Return list of modified, staged, or untracked files in the workspace."""
-    ws = Path(workspace or WORKSPACE).resolve()
+    """Return tracked files with uncommitted (staged or unstaged) changes.
+
+    Untracked files are ignored: a hard reset never touches them, and build
+    artifacts such as __pycache__ must not block rollback or resume.
+    """
+    ws = Path(workspace or current_workspace()).resolve()
     try:
         res = subprocess.run(
-            ["git", "status", "--porcelain"],
+            ["git", "status", "--porcelain", "--untracked-files=no"],
             cwd=ws,
             capture_output=True,
             text=True,
             errors="replace",
             check=False,
             env=sanitize_subprocess_env(str(ws)),
+            stdin=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
         )
         if res.returncode == 0 and res.stdout.strip():
             return [line.strip() for line in res.stdout.splitlines() if line.strip()]
@@ -145,7 +155,7 @@ class ResumeManager:
     """Coordinates workspace integrity checks and task resumption from DAG checkpoints."""
 
     def __init__(self, workspace: str | Path | None = None) -> None:
-        self.workspace = Path(workspace or WORKSPACE).resolve()
+        self.workspace = Path(workspace or current_workspace()).resolve()
 
     def get_resumable_state(self, task_id: str) -> ResumePlan:
         """Inspect task status, subtasks, and latest checkpoint to construct a ResumePlan."""
@@ -361,16 +371,8 @@ class ResumeManager:
             )
 
         elif decision_upper == "ROLLBACK":
-            checkpoint = manager.get_latest_checkpoint(task_id)
-            from qz_tools import rollback_last_change
-            rollback_msg = rollback_last_change()
-            manager.update_status(task_id, TaskStatus.CANCELLED, current_step="rolled_back")
-            manager.log_event(task_id, "TASK_ROLLED_BACK", {"checkpoint": checkpoint, "detail": rollback_msg})
-            return ResumeOutcome(
-                success=True,
-                action="ROLLED_BACK",
-                message=f"Task rolled back: {rollback_msg}",
-            )
+            # Undo every Qazterion commit this task made (safety checks included).
+            return self.safe_rollback_to_checkpoint(task_id, workspace=ws)
 
         elif decision_upper == "DISCARD":
             manager.update_status(task_id, TaskStatus.CANCELLED, current_step="discarded")
@@ -386,110 +388,129 @@ class ResumeManager:
                 f"Unknown resume decision: '{decision}'. Supported: RESUME, RESTART_CURRENT_SUBTASK, ROLLBACK, DISCARD"
             )
 
+    def _git(self, ws: Path, args: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args],
+            cwd=ws,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            check=False,
+            env=sanitize_subprocess_env(str(ws)),
+            stdin=subprocess.DEVNULL,
+            creationflags=NO_WINDOW,
+        )
+
     def preview_rollback(
         self,
         task_id: str,
         checkpoint_id: int | None = None,
         workspace: Path | str | None = None,
     ) -> dict[str, Any]:
-        """Inspect and report what changes would occur if a rollback is performed."""
+        """Describe what rolling back would do, without changing anything.
+
+        Rolling back to a checkpoint restores the repository to the state *before*
+        that checkpoint's commit (undoing that step and every later one). Without
+        ``checkpoint_id`` the task's first checkpoint is used, undoing the whole
+        task. Only commits created by Qazterion may be discarded, and only when
+        the working tree has no uncommitted changes.
+        """
         ws = Path(workspace or self.workspace).resolve()
         manager = get_manager()
+
+        def blocked(reason: str, message: str, **extra: Any) -> dict[str, Any]:
+            return {"can_rollback": False, "reason": reason, "message": message, "affected_files": [], **extra}
+
         integrity = self.verify_workspace_integrity(task_id, ws)
-
         if integrity.status == IntegrityStatus.DIRTY_UNCOMMITTED:
-            return {
-                "can_rollback": False,
-                "reason": "dirty_workspace",
-                "message": f"Rollback blocked: {len(integrity.uncommitted_files)} uncommitted file(s) in workspace. Commit or stash them first.",
-                "uncommitted_files": integrity.uncommitted_files,
-                "target_commit": None,
-                "affected_files": [],
-            }
+            return blocked(
+                "dirty_workspace",
+                f"Rollback blocked: {len(integrity.uncommitted_files)} uncommitted file(s) in workspace. Commit or stash them first.",
+                uncommitted_files=integrity.uncommitted_files,
+                target_commit=None,
+            )
 
-        # Find target commit and verify checkpoint ownership
         if checkpoint_id is not None:
             checkpoint = manager.get_checkpoint(checkpoint_id)
-            if checkpoint and str(checkpoint.get("task_id")) != str(task_id):
-                return {
-                    "can_rollback": False,
-                    "reason": "unowned_checkpoint",
-                    "message": f"Rollback blocked: checkpoint {checkpoint_id} does not belong to task {task_id}.",
-                    "affected_files": [],
-                }
+            if checkpoint is None:
+                return blocked("unknown_checkpoint", f"Rollback blocked: checkpoint {checkpoint_id} does not exist.")
+            if str(checkpoint.get("task_id")) != str(task_id):
+                return blocked("unowned_checkpoint", f"Rollback blocked: checkpoint {checkpoint_id} does not belong to task {task_id}.")
         else:
-            checkpoint = manager.get_latest_checkpoint(task_id)
+            checkpoints = manager.list_checkpoints(task_id=task_id, limit=1000)
+            checkpoint = checkpoints[-1] if checkpoints else None
+            if checkpoint is None:
+                return blocked("no_checkpoint", "Rollback blocked: this task has no recorded checkpoint commits.")
 
-        target_commit = checkpoint.get("git_commit_hash") if checkpoint else None
+        commit = str(checkpoint.get("git_commit_hash") or "")
+        if not commit:
+            return blocked("no_checkpoint", "Rollback blocked: the checkpoint has no commit recorded.")
         current_head = get_current_head(str(ws))
-
         if not current_head:
-            return {
-                "can_rollback": False,
-                "reason": "no_git_head",
-                "message": "Git HEAD commit could not be determined.",
-                "affected_files": [],
-            }
+            return blocked("no_git_head", "Git HEAD commit could not be determined.")
 
-        if target_commit and current_head.startswith(target_commit):
-            target_commit = f"{target_commit}~1"
-
-        target_ref = target_commit or "HEAD~1"
-
-        # Verify target is ancestor of current_head
-        anc_res = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", target_ref, current_head],
-            cwd=ws,
-            capture_output=True,
-            check=False,
-            env=sanitize_subprocess_env(str(ws)),
-        )
-        if anc_res.returncode != 0:
-            return {
-                "can_rollback": False,
-                "reason": "not_ancestor",
-                "message": f"Rollback blocked: target commit '{target_ref[:7]}' is not an ancestor of current HEAD '{current_head[:7]}'.",
-                "uncommitted_files": [],
-                "target_commit": target_ref,
-                "current_head": current_head,
-                "affected_files": [],
-            }
-
-        try:
-            res = subprocess.run(
-                ["git", "diff", "--numstat", target_ref, current_head],
-                cwd=ws,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                check=False,
-                env=sanitize_subprocess_env(str(ws)),
+        if self._git(ws, ["merge-base", "--is-ancestor", commit, current_head]).returncode != 0:
+            return blocked(
+                "not_ancestor",
+                f"Rollback blocked: checkpoint commit '{commit[:7]}' is not part of the current branch history.",
+                target_commit=commit,
+                current_head=current_head,
             )
-            affected = []
-            if res.returncode == 0:
-                for line in res.stdout.splitlines():
-                    parts = line.split("\t", 2)
-                    if len(parts) == 3:
-                        affected.append({
-                            "additions": int(parts[0]) if parts[0].isdigit() else 0,
-                            "deletions": int(parts[1]) if parts[1].isdigit() else 0,
-                            "path": parts[2],
-                        })
-            return {
-                "can_rollback": True,
-                "reason": "ready",
-                "message": f"Safe rollback ready. Reverting {len(affected)} file(s) from {current_head[:7]} to {target_ref[:7]}.",
-                "target_commit": target_ref,
-                "current_head": current_head,
-                "affected_files": affected,
-            }
-        except Exception as e:
-            return {
-                "can_rollback": False,
-                "reason": "git_error",
-                "message": f"Could not inspect diff for rollback: {e}",
-                "affected_files": [],
-            }
+        target_ref = f"{commit}~1"
+        if self._git(ws, ["rev-parse", "--verify", "--quiet", target_ref]).returncode != 0:
+            return blocked("no_parent", "Rollback blocked: the checkpoint is the repository's first commit.")
+
+        listing = self._git(ws, ["rev-list", f"{target_ref}..{current_head}"])
+        discarded = [line.strip() for line in listing.stdout.splitlines() if line.strip()]
+        from qz_tools import AGENT_COMMIT_TRAILER
+
+        foreign = []
+        for sha in discarded:
+            body = self._git(ws, ["log", "-1", "--format=%an%n%B", sha]).stdout
+            first = body.splitlines()[0].strip() if body else ""
+            if AGENT_COMMIT_TRAILER not in body and first != "Qazterion Agent":
+                foreign.append(sha[:7])
+        if foreign:
+            return blocked(
+                "foreign_commits",
+                f"Rollback blocked: it would discard {len(foreign)} commit(s) not made by Qazterion ({', '.join(foreign[:5])}).",
+                target_commit=target_ref,
+                current_head=current_head,
+            )
+
+        # A hard reset leaves untracked files alone, except where the target
+        # commit has a file at the same path (one the agent deleted later).
+        recreated = set(self._git(ws, ["diff", "--name-only", "--diff-filter=D", target_ref, current_head]).stdout.split())
+        untracked = set(self._git(ws, ["ls-files", "--others", "--exclude-standard"]).stdout.split())
+        clobbered = sorted(recreated & untracked)
+        if clobbered:
+            return blocked(
+                "untracked_conflict",
+                f"Rollback blocked: it would overwrite untracked file(s): {', '.join(clobbered[:5])}.",
+                target_commit=target_ref,
+                current_head=current_head,
+            )
+
+        res = self._git(ws, ["diff", "--numstat", target_ref, current_head])
+        affected = []
+        if res.returncode == 0:
+            for line in res.stdout.splitlines():
+                parts = line.split("\t", 2)
+                if len(parts) == 3:
+                    affected.append({
+                        "additions": int(parts[0]) if parts[0].isdigit() else 0,
+                        "deletions": int(parts[1]) if parts[1].isdigit() else 0,
+                        "path": parts[2],
+                    })
+        return {
+            "can_rollback": True,
+            "reason": "ready",
+            "message": f"Safe rollback ready: undo {len(discarded)} Qazterion commit(s), restoring {len(affected)} file(s).",
+            "target_commit": target_ref,
+            "current_head": current_head,
+            "discarded_commits": [sha[:7] for sha in discarded],
+            "affected_files": affected,
+        }
 
     def safe_rollback_to_checkpoint(
         self,
@@ -498,62 +519,39 @@ class ResumeManager:
         workspace: Path | str | None = None,
         force: bool = False,
     ) -> ResumeOutcome:
-        """Safely restore a previous checkpoint commit without blindly destroying untracked files."""
+        """Undo Qazterion commits back to before a checkpoint.
+
+        ``force`` is accepted for API compatibility but never bypasses the
+        safety checks: uncommitted work and foreign commits are always protected.
+        """
+        del force
         ws = Path(workspace or self.workspace).resolve()
         manager = get_manager()
         preview = self.preview_rollback(task_id, checkpoint_id=checkpoint_id, workspace=ws)
+        if not preview["can_rollback"]:
+            return ResumeOutcome(success=False, action="BLOCKED", message=preview["message"], result=preview)
 
-        if not preview["can_rollback"] and not force:
-            return ResumeOutcome(
-                success=False,
-                action="BLOCKED",
-                message=preview["message"],
-                result=preview,
-            )
-
-        target_ref = preview.get("target_commit") or "HEAD~1"
+        target_ref = preview["target_commit"]
         try:
-            res = subprocess.run(
-                ["git", "reset", "--hard", target_ref],
-                cwd=ws,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                check=False,
-                env=sanitize_subprocess_env(str(ws)),
-            )
-            if res.returncode != 0:
-                return ResumeOutcome(
-                    success=False,
-                    action="FAILED",
-                    message=f"Git reset failed: {res.stderr or res.stdout}",
-                )
-
-            manager.update_status(task_id, TaskStatus.CANCELLED, current_step="rolled_back")
-            manager.log_event(task_id, "TASK_ROLLED_BACK", {
-                "target_ref": target_ref,
-                "preview": preview,
-            })
-            return ResumeOutcome(
-                success=True,
-                action="ROLLED_BACK",
-                message=f"Safe rollback complete to {target_ref}.",
-                result=preview,
-            )
+            res = self._git(ws, ["reset", "--hard", target_ref])
         except Exception as e:
-            return ResumeOutcome(
-                success=False,
-                action="FAILED",
-                message=f"Safe rollback encountered error: {e}",
-            )
+            return ResumeOutcome(success=False, action="FAILED", message=f"Safe rollback encountered error: {e}")
+        if res.returncode != 0:
+            return ResumeOutcome(success=False, action="FAILED", message=f"Git reset failed: {res.stderr or res.stdout}")
+
+        manager.update_status(task_id, TaskStatus.CANCELLED, current_step="rolled_back")
+        manager.log_event(task_id, "TASK_ROLLED_BACK", {"target_ref": target_ref, "preview": preview})
+        return ResumeOutcome(
+            success=True,
+            action="ROLLED_BACK",
+            message=f"Safe rollback complete: workspace restored to {target_ref}.",
+            result=preview,
+        )
 
 
-_resume_manager: ResumeManager | None = None
+
 
 
 def get_resume_manager(workspace: str | Path | None = None) -> ResumeManager:
-    global _resume_manager
-    ws = Path(workspace or WORKSPACE).resolve()
-    if _resume_manager is None or _resume_manager.workspace != ws:
-        _resume_manager = ResumeManager(ws)
-    return _resume_manager
+    """Return a ResumeManager bound to ``workspace`` (cheap and stateless, so not shared)."""
+    return ResumeManager(Path(workspace or current_workspace()).resolve())

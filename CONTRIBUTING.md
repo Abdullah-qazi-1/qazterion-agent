@@ -9,7 +9,6 @@ Thank you for your interest in contributing to Qazterion! We welcome contributio
 ### Prerequisites
 * **Python 3.10+**
 * **Git**
-* **Docker Desktop** *(Optional, for sandbox isolation)*
 
 ### Getting Started
 

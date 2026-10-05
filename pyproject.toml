@@ -4,27 +4,43 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qazterion"
-version = "2.0.0"
-description = "Autonomous Multi-Provider Coding Agent and Cross-Platform CLI"
-authors = [
-    { name = "Abdullah", email = "abdullahizaq321@gmail.com" }
-]
+version = "2.3.0"
+description = "Lightweight multi-provider, multi-key AI coding agent and CLI"
+authors = [{ name = "Abdullah", email = "abdullahizaq321@gmail.com" }]
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "litellm[proxy]>=1.40.0",
-    "openai>=1.20.0",
-    "PyYAML>=6.0.0",
+    "openai>=1.40.0",
+    "PyYAML>=6.0",
     "cryptography>=41.0.0",
     "rich>=13.0.0",
     "prompt_toolkit>=3.0.0",
     "python-dotenv>=1.0.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=7.0.0"]
+build = ["pyinstaller>=6.0"]
+
 [project.scripts]
 qazterion = "qz_cli.app:main"
 qz = "qz_cli.app:main"
+qazterion-setup = "qz_desktop_backend:cli_main"
+
+[tool.setuptools]
+py-modules = [
+    "qz_agent", "qz_context", "qz_desktop_backend", "qz_desktop_bridge", "qz_environment",
+    "qz_health", "qz_indexer", "qz_keystore", "qz_memory", "qz_paths", "qz_repair",
+    "qz_task_compiler", "qz_tools", "qz_usage_tracker",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["qz_*"]
+
+[tool.setuptools.package-data]
+qz_providers = ["default_providers.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]

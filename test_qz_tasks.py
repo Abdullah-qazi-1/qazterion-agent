@@ -1,3 +1,4 @@
+import os
 import io
 import sqlite3
 import tempfile
@@ -110,9 +111,10 @@ class TaskManagerPersistenceTests(unittest.TestCase):
             ["TASK_STARTED", "MODEL_SELECTED", "CHECKPOINT_CREATED"],
         )
 
+        # "Latest" means most recently created: the iteration counter restarts
+        # for every subtask, so it cannot order checkpoints across subtasks.
         latest = self.manager.get_latest_checkpoint(first)
-        self.assertEqual(latest["iteration_number"], 3)
-        self.assertEqual(latest["git_commit_hash"], "ccc")
+        self.assertEqual(latest["git_commit_hash"], "bbb")
         other = self.manager.get_latest_checkpoint(second)
         self.assertEqual(other["git_commit_hash"], "zzz")
 
@@ -156,7 +158,7 @@ class TaskManagerPersistenceTests(unittest.TestCase):
         reset_manager()
         manager = get_manager()
         self.assertNotEqual(manager.db_path.resolve(), user_db_path().resolve())
-        self.assertTrue(str(manager.db_path.name).startswith("qazterion_tasks_test_"))
+        self.assertEqual(manager.db_path, Path(os.environ["QAZTERION_TASKS_DB"]))
         task_id = manager.create_task("isolated suite row", "/ws")
         user_db = user_db_path()
         if user_db.exists():

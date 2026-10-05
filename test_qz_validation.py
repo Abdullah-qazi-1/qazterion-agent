@@ -183,7 +183,6 @@ class ExecutorValidationGateIntegrationTests(unittest.TestCase):
             patch("qz_agent.request_completion", return_value=(mock_response, "groq-fast"), create=True),
             patch("qz_agent.ValidationPipeline", return_value=mock_pipeline_instance, create=True),
             patch("qz_core.executor.classify_task_complexity", return_value="simple"),
-            patch("qz_core.executor.select_route", return_value=("groq-fast", "GROQ_KEY_1")),
             patch("qz_core.executor.request_completion", return_value=(mock_response, "groq-fast")),
             patch("qz_core.executor.ValidationPipeline", return_value=mock_pipeline_instance),
             patch("qz_core.executor._task_requires_test_changes", return_value=False),

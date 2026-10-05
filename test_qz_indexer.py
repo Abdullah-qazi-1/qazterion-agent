@@ -43,7 +43,9 @@ class CodebaseIndexerTests(unittest.TestCase):
         self.assertEqual(entries["src/auth.py"]["functions"], ["login_user", "logout_user"])
         self.assertEqual(entries["src/auth.py"]["classes"], ["UserSession"])
         self.assertIn("syntax errors", entries["src/broken.py"]["summary"])
-        self.assertTrue((self.workspace / qz_indexer.INDEX_FILENAME).is_file())
+        self.assertTrue(qz_indexer.index_cache_path(self.workspace).is_file())
+        # The cache never lands inside the user's project.
+        self.assertFalse((self.workspace / qz_indexer.INDEX_FILENAME).exists())
 
     def test_cache_reuses_then_rebuilds_when_a_file_changes(self):
         first_index, rebuilt = qz_indexer.load_or_build_index(self.workspace)
@@ -69,7 +71,7 @@ class CodebaseIndexerTests(unittest.TestCase):
 
     def test_index_cache_is_valid_json(self):
         qz_indexer.build_index(self.workspace)
-        with (self.workspace / qz_indexer.INDEX_FILENAME).open(encoding="utf-8") as cache:
+        with qz_indexer.index_cache_path(self.workspace).open(encoding="utf-8") as cache:
             cache = json.load(cache)
         self.assertEqual(cache["version"], qz_indexer.INDEX_VERSION)
 

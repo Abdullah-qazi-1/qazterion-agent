@@ -1,0 +1,116 @@
+# Qazterion provider catalog (built-in defaults).
+#
+# This file is the single source of truth for which providers, models and
+# routing roles exist. Users override or extend it with
+#   <data dir>/providers.yaml   (e.g. %LOCALAPPDATA%\Qazterion\providers.yaml)
+# using the same structure; user entries are merged over these defaults.
+#
+# API keys are NEVER stored here. Keys come from the encrypted keystore
+# (`/keys add <provider>` or the desktop app) or from environment variables
+# named <key_prefix>_<N>, e.g. GEMINI_KEY_1, GEMINI_KEY_2, GROQ_KEY_1.
+#
+# Model ids: prefer each provider's rolling "-latest" aliases, because pinned
+# versions get retired (a retired model is benched automatically for 6 hours
+# and the next candidate is used). `/model` and the desktop "Discover models"
+# button show what each of your keys can actually reach.
+#
+# Adding a provider: give it an OpenAI-compatible base_url, a key_prefix and
+# its models, then reference "<provider>/<model>" from a role. No code change
+# is required.
+
+settings:
+  # balanced: rotate across healthy keys (least recently used first)
+  # priority: always use the first healthy key in index order
+  key_strategy: balanced
+  request_timeout_s: 60
+  max_attempts: 8              # provider calls per request before giving up
+  max_wait_for_cooldown_s: 30  # wait this long for a rate-limited key before failing
+
+providers:
+  gemini:
+    display_name: Google Gemini
+    adapter: openai_compatible
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    key_prefix: GEMINI_KEY
+    models:
+      gemini-flash-latest: {context_window: 1048576, tools: true}
+      gemini-flash-lite-latest: {context_window: 1048576, tools: true}
+      gemini-pro-latest: {context_window: 1048576, tools: true}
+  groq:
+    display_name: Groq
+    adapter: openai_compatible
+    base_url: https://api.groq.com/openai/v1
+    key_prefix: GROQ_KEY
+    models:
+      llama-3.3-70b-versatile: {context_window: 131072, tools: true}
+      llama-3.1-8b-instant: {context_window: 131072, tools: true}
+  mistral:
+    display_name: Mistral AI
+    adapter: openai_compatible
+    base_url: https://api.mistral.ai/v1
+    key_prefix: MISTRAL_KEY
+    models:
+      codestral-latest: {context_window: 32768, tools: true}
+      mistral-small-latest: {context_window: 131072, tools: true}
+      mistral-medium-latest: {context_window: 131072, tools: true}
+  openrouter:
+    display_name: OpenRouter
+    adapter: openrouter
+    base_url: https://openrouter.ai/api/v1
+    key_prefix: OPENROUTER_KEY
+    models:
+      meta-llama/llama-3.3-70b-instruct: {context_window: 131072, tools: true}
+  deepseek:
+    display_name: DeepSeek
+    adapter: openai_compatible
+    base_url: https://api.deepseek.com/v1
+    key_prefix: DEEPSEEK_KEY
+    models:
+      deepseek-flash: {context_window: 65536, tools: true}
+      deepseek-v4-pro: {context_window: 65536, tools: true}
+
+# Roles are what the agent asks for. Each role lists models in preference
+# order, spread across providers so one exhausted account never stops work.
+# Models whose provider has no usable key are skipped automatically.
+roles:
+  classify:
+    - gemini/gemini-flash-lite-latest
+    - groq/llama-3.1-8b-instant
+    - mistral/mistral-small-latest
+    - openrouter/meta-llama/llama-3.3-70b-instruct
+    - deepseek/deepseek-flash
+  fast:
+    - gemini/gemini-flash-lite-latest
+    - groq/llama-3.3-70b-versatile
+    - gemini/gemini-flash-latest
+    - mistral/mistral-small-latest
+    - openrouter/meta-llama/llama-3.3-70b-instruct
+    - deepseek/deepseek-flash
+    - groq/llama-3.1-8b-instant
+  coder:
+    - gemini/gemini-flash-latest
+    - groq/llama-3.3-70b-versatile
+    - mistral/codestral-latest
+    - openrouter/meta-llama/llama-3.3-70b-instruct
+    - deepseek/deepseek-flash
+    - gemini/gemini-flash-lite-latest
+  planner:
+    - gemini/gemini-flash-latest
+    - groq/llama-3.3-70b-versatile
+    - mistral/mistral-small-latest
+    - openrouter/meta-llama/llama-3.3-70b-instruct
+    - deepseek/deepseek-flash
+    - gemini/gemini-flash-lite-latest
+  reasoner:
+    - gemini/gemini-pro-latest
+    - mistral/mistral-medium-latest
+    - deepseek/deepseek-v4-pro
+    - gemini/gemini-flash-latest
+    - openrouter/meta-llama/llama-3.3-70b-instruct
+    - groq/llama-3.3-70b-versatile
+
+# Older alias names still accepted by the agent and in user overrides.
+role_aliases:
+  groq-fast: fast
+  coder-backup: fast
+  coder-strong: coder

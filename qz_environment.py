@@ -2,6 +2,8 @@
 from __future__ import annotations
 import os
 import subprocess
+
+from qz_sandbox.backend import NO_WINDOW
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,10 +56,10 @@ def prepare_python_environment(env: ProjectEnvironment, *, approved: bool = Fals
     from qz_sandbox.backend import sanitize_subprocess_env
     clean_env = sanitize_subprocess_env(str(env.workspace))
     target = env.workspace / ".venv"
-    made = subprocess.run([sys.executable, "-m", "venv", str(target)], cwd=env.workspace, capture_output=True, text=True, check=False, env=clean_env)
+    made = subprocess.run([sys.executable, "-m", "venv", str(target)], cwd=env.workspace, capture_output=True, text=True, check=False, env=clean_env, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
     if made.returncode: return "Environment creation failed: " + (made.stderr or made.stdout or "unknown error").strip()
     interpreter = target / ("Scripts/python.exe" if os.name == "nt" else "bin/python"); requirements = env.workspace / "requirements.txt"
     if not requirements.is_file(): return f"Environment created: {interpreter}. No requirements.txt was installed."
-    installed = subprocess.run([str(interpreter), "-m", "pip", "install", "-r", str(requirements)], cwd=env.workspace, capture_output=True, text=True, check=False, env=clean_env)
+    installed = subprocess.run([str(interpreter), "-m", "pip", "install", "-r", str(requirements)], cwd=env.workspace, capture_output=True, text=True, check=False, env=clean_env, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
     if installed.returncode: return "Dependencies failed to install: " + (installed.stderr or installed.stdout or "unknown error").strip()
     return f"Environment created and dependencies installed: {interpreter}"

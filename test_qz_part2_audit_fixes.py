@@ -17,7 +17,7 @@ from unittest.mock import MagicMock, patch
 
 from qz_core import executor
 from qz_core.autonomous_loop import AutonomousRunner
-from qz_core.client import FallbackCompletions
+from qz_providers.adapters import sanitize_messages
 from qz_core.dag_executor import HardDAGExecutor
 from qz_recovery.resume_manager import ResumeManager
 from qz_tasks.models import SubtaskStatus, TaskStatus
@@ -72,7 +72,6 @@ class Part2AuditFixesTests(unittest.TestCase):
              patch("qz_core.dag_executor.update_status"), \
              patch("qz_core.dag_executor.update_subtask_status"), \
              patch("qz_core.dag_executor.log_event"), \
-             patch("qz_core.dag_executor.select_route", return_value=("groq-fast", "KEY_1")), \
              patch("qz_core.dag_executor.request_completion", side_effect=[(resp1, "groq-fast"), (resp2, "groq-fast")]), \
              patch.object(dag_exec.val_pipeline, "run") as mock_val, \
              patch.dict(qz_tools.TOOL_FUNCTIONS, {"make_directory": MagicMock()}) as mock_funcs:
@@ -116,7 +115,12 @@ class Part2AuditFixesTests(unittest.TestCase):
 
     def test_rollback_blocks_non_ancestor_commits(self):
         mgr = ResumeManager(workspace="D:/dummy_ws")
+        fake_tasks = MagicMock()
+        fake_tasks.get_task.return_value = None
+        fake_tasks.get_latest_checkpoint.return_value = None
+        fake_tasks.list_checkpoints.return_value = [{"id": 1, "task_id": "task_1", "git_commit_hash": "0123abc"}]
         with patch("qz_recovery.resume_manager.get_current_head", return_value="abcdef123456"), \
+             patch("qz_recovery.resume_manager.get_manager", return_value=fake_tasks), \
              patch("qz_recovery.resume_manager.subprocess.run") as mock_subproc:
 
             # Mock merge-base returning non-zero (target not ancestor)
@@ -125,25 +129,21 @@ class Part2AuditFixesTests(unittest.TestCase):
             self.assertFalse(preview["can_rollback"])
             self.assertEqual(preview["reason"], "not_ancestor")
 
-    def test_client_sanitizes_messages_before_proxy_call(self):
-        raw_client = MagicMock()
-        raw_client.chat.completions.create.return_value = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=[]))]
-        )
-        fb = FallbackCompletions(raw_client)
-
+    def test_messages_are_sanitized_for_strict_providers(self):
         messages = [
             {"role": "system", "content": "Instruction 1"},
             {"role": "system", "content": "Instruction 2 (middle)"},
             {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": None},
         ]
-        fb.create(model="groq-fast", messages=messages)
-
-        raw_client.chat.completions.create.assert_called_once()
-        sent_messages = raw_client.chat.completions.create.call_args.kwargs["messages"]
-        # Middle system message converted to user role
-        self.assertEqual(sent_messages[1]["role"], "user")
-        self.assertIn("[System Note]:", sent_messages[1]["content"])
+        sent = sanitize_messages(messages)
+        self.assertEqual(sent[0]["role"], "system")
+        self.assertEqual(sent[1]["role"], "user")
+        self.assertIn("[System Note]:", sent[1]["content"])
+        self.assertEqual(sent[3]["content"], "")
+        self.assertEqual(sent[4]["tool_call_id"], "c1")
+        self.assertEqual(sent[4]["content"], "")
 
 
 if __name__ == "__main__":

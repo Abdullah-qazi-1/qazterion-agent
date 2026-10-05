@@ -17,7 +17,7 @@ from typing import Any
 
 from qz_environment import detect_project_environment
 from qz_security.secret_scanner import scan as scan_secrets
-from qz_tools import WORKSPACE, run_command
+from qz_tools import current_workspace, run_command
 
 
 class CheckStatus(str, Enum):
@@ -60,6 +60,17 @@ def _truncate_output(text: str | None, max_length: int = 4000) -> str:
     return text[:max_length] + f"\n... [truncated, {len(text)} total characters]"
 
 
+def _run_in(workspace: Path, command: str, timeout: int) -> str:
+    """Run ``command`` through the security gateway with ``workspace`` as its cwd."""
+    from qz_core.common import TaskContext, get_task_context, task_context_scope
+
+    ctx = get_task_context()
+    if ctx is not None and Path(ctx.workspace).resolve() == Path(workspace).resolve():
+        return run_command(command, timeout=timeout)
+    with task_context_scope(TaskContext(task_id=ctx.task_id if ctx else "validation", workspace=Path(workspace))):
+        return run_command(command, timeout=timeout)
+
+
 def _command_failed(result_str: str) -> bool:
     """Return True if command output indicates failure (non-zero exit code or error)."""
     text = str(result_str).strip()
@@ -76,9 +87,15 @@ def run_tests(
     command: str | None = None,
     timeout: int = 180,
     is_required: bool = True,
+    baseline: Any | None = None,
 ) -> CheckResult:
-    """Run project tests via the existing sandbox/security tool path."""
-    ws = Path(workspace or WORKSPACE).resolve()
+    """Run project tests through the security gateway.
+
+    ``baseline`` (a ``TestBaseline`` captured before the task started) lets
+    failures that already existed, unchanged, count as a pass: the agent must
+    not be blocked by problems it did not cause.
+    """
+    ws = Path(workspace or current_workspace()).resolve()
     start_time = time.monotonic()
 
     test_cmd = command
@@ -96,10 +113,20 @@ def run_tests(
         )
 
     try:
-        raw_output = run_command(test_cmd, timeout=timeout)
+        raw_output = _run_in(ws, test_cmd, timeout)
         duration = time.monotonic() - start_time
         failed = _command_failed(raw_output)
 
+        if failed and baseline is not None and _matches_baseline(test_cmd, raw_output, baseline):
+            return CheckResult(
+                name="tests",
+                status=CheckStatus.PASS,
+                summary=f"Only pre-existing test failures remain (unchanged since before the task): '{test_cmd}'",
+                output=_truncate_output(raw_output),
+                command=test_cmd,
+                duration_seconds=duration,
+                is_required=is_required,
+            )
         if failed:
             return CheckResult(
                 name="tests",
@@ -132,12 +159,23 @@ def run_tests(
         )
 
 
+def _matches_baseline(command: str, raw_output: str, baseline: Any) -> bool:
+    try:
+        from qz_core.executor import _test_failure_signature
+    except Exception:
+        return False
+    return (
+        str(getattr(baseline, "command", "")).strip() == str(command).strip()
+        and _test_failure_signature(raw_output) == getattr(baseline, "signature", None)
+    )
+
+
 def run_lint(
     workspace: Path | str | None = None,
     is_required: bool = False,
 ) -> CheckResult:
     """Detect and run configured linters (ruff/flake8 for Python, eslint for JS/TS)."""
-    ws = Path(workspace or WORKSPACE).resolve()
+    ws = Path(workspace or current_workspace()).resolve()
     start_time = time.monotonic()
 
     lint_cmd: str | None = None
@@ -179,7 +217,7 @@ def run_lint(
         )
 
     try:
-        raw_output = run_command(lint_cmd, timeout=60)
+        raw_output = _run_in(ws, lint_cmd, 60)
         duration = time.monotonic() - start_time
         failed = _command_failed(raw_output)
 
@@ -220,7 +258,7 @@ def run_typecheck(
     is_required: bool = False,
 ) -> CheckResult:
     """Detect and run configured typecheckers (mypy/pyright for Python, tsc for TS)."""
-    ws = Path(workspace or WORKSPACE).resolve()
+    ws = Path(workspace or current_workspace()).resolve()
     start_time = time.monotonic()
 
     typecheck_cmd: str | None = None
@@ -262,7 +300,7 @@ def run_typecheck(
         )
 
     try:
-        raw_output = run_command(typecheck_cmd, timeout=90)
+        raw_output = _run_in(ws, typecheck_cmd, 90)
         duration = time.monotonic() - start_time
         failed = _command_failed(raw_output)
 
@@ -303,7 +341,7 @@ def run_build(
     is_required: bool = False,
 ) -> CheckResult:
     """Detect and execute a project build step if applicable."""
-    ws = Path(workspace or WORKSPACE).resolve()
+    ws = Path(workspace or current_workspace()).resolve()
     start_time = time.monotonic()
 
     build_cmd: str | None = None
@@ -330,7 +368,7 @@ def run_build(
         )
 
     try:
-        raw_output = run_command(build_cmd, timeout=120)
+        raw_output = _run_in(ws, build_cmd, 120)
         duration = time.monotonic() - start_time
         failed = _command_failed(raw_output)
 
@@ -382,7 +420,7 @@ def run_security_scan(
     is_required: bool = False,
 ) -> CheckResult:
     """Scan workspace file contents for committed secrets and credentials."""
-    ws = Path(workspace or WORKSPACE).resolve()
+    ws = Path(workspace or current_workspace()).resolve()
     start_time = time.monotonic()
 
     if not ws.is_dir():

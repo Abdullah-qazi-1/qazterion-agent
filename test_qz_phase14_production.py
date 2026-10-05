@@ -31,7 +31,8 @@ class Phase14ProductionTests(unittest.TestCase):
         self.assertIn("components", d)
         self.assertIn("python", d["components"])
         self.assertIn("git", d["components"])
-        self.assertIn("docker", d["components"])
+        self.assertIn("execution", d["components"])
+        self.assertNotIn("docker", d["components"])  # Docker is not required
         self.assertIn("keystore", d["components"])
         self.assertIn("providers", d["components"])
         self.assertIn("workspace", d["components"])
@@ -45,14 +46,14 @@ class Phase14ProductionTests(unittest.TestCase):
         self.assertEqual(res.status, "invalid_key")
         self.assertIn("cannot be empty", res.message)
 
-    @patch("urllib.request.urlopen")
-    def test_provider_connectivity_valid_response(self, mock_urlopen):
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({"data": [{"id": "llama-3.3-70b-versatile"}]}).encode("utf-8")
-        mock_resp.__enter__.return_value = mock_resp
-        mock_urlopen.return_value = mock_resp
-
-        res = test_provider_connectivity("groq", "gsk_valid_secret_key_1234567890")
+    def test_provider_connectivity_valid_response(self):
+        page = MagicMock()
+        page.data = [MagicMock(id="llama-3.3-70b-versatile", model_extra={})]
+        fake_client = MagicMock()
+        fake_client.models.list.return_value = page
+        with patch("openai.OpenAI", return_value=fake_client) as client_cls:
+            res = test_provider_connectivity("groq", "gsk_valid_secret_key_1234567890")
+        self.assertEqual(client_cls.call_args.kwargs["base_url"], "https://api.groq.com/openai/v1")
         self.assertTrue(res.connected)
         self.assertEqual(res.status, "valid")
         self.assertEqual(res.models_found, 1)
@@ -68,10 +69,10 @@ class Phase14ProductionTests(unittest.TestCase):
         self.assertIn("qazterion = \"qz_cli.app:main\"", pyproject_text)
         self.assertIn("qz = \"qz_cli.app:main\"", pyproject_text)
 
-        setup_path = root / "setup.py"
-        self.assertTrue(setup_path.is_file(), "setup.py missing")
-        setup_text = setup_path.read_text(encoding="utf-8")
-        self.assertIn("\"qazterion = qz_cli.app:main\"", setup_text)
+        # Single source of packaging metadata; LiteLLM is no longer a dependency.
+        self.assertFalse((root / "setup.py").exists())
+        self.assertNotIn("litellm", pyproject_text.lower())
+        self.assertIn("default_providers.yaml", pyproject_text)
 
 
     def test_release_infrastructure_files_exist(self):

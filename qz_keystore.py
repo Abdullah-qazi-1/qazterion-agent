@@ -1,7 +1,6 @@
-"""Phase 12 — encrypted local storage for provider API keys and the LiteLLM
-master key.
+"""Encrypted local storage for provider API keys.
 
-Design goals (see IMPLEMENTATION_PLAN.md, Phase 12):
+Design goals:
 - Keys are never written to disk in plaintext and are never printed in full.
 - On Windows, keys are protected with DPAPI (`CryptProtectData` /
   `CryptUnprotectData`) via `ctypes`, so no extra OS-level dependency is
@@ -20,16 +19,15 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
 
-# Providers required by Phase 12 / IMPLEMENTATION_PLAN.md. The family name
-# matches the `<FAMILY>_<N>` convention already used by `.env` /
-# `generate_config.py` (e.g. "GROQ_KEY_1"), so keystore output can be handed
-# straight to `generate_config.expand_model_list` without translation.
+# Built-in key families. A family is the env-var prefix of a provider's keys
+# (GROQ_KEY_1, GROQ_KEY_2, ...). Providers added to providers.yaml register
+# their own family (its ``key_prefix``) on first use.
 PROVIDER_FAMILIES: dict[str, str] = {
     "groq": "GROQ_KEY",
     "gemini": "GEMINI_KEY",
@@ -38,7 +36,6 @@ PROVIDER_FAMILIES: dict[str, str] = {
     "deepseek": "DEEPSEEK_KEY",
 }
 SUPPORTED_PROVIDERS: tuple[str, ...] = tuple(PROVIDER_FAMILIES)
-_MASTER_ENTRY_NAME = "LITELLM_MASTER_KEY"
 
 
 def register_provider_family(provider: str, family: str | None = None) -> str:
@@ -79,20 +76,15 @@ def _default_store_path() -> Path:
     override = os.environ.get("QAZTERION_KEYSTORE_PATH")
     if override:
         return Path(override)
-    data_dir = os.environ.get("QAZTERION_DATA_DIR")
-    if data_dir:
-        return Path(data_dir) / "keystore.dat"
-    if sys.platform == "win32":
-        local_base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-        local_path = Path(local_base) / "Qazterion" / "keystore.dat"
-        if local_path.is_file():
-            return local_path
-        appdata_base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
-        desktop_path = Path(appdata_base) / "qazterion-desktop" / "backend-data" / "keystore.dat"
-        if desktop_path.is_file():
-            return desktop_path
-        return local_path
-    return Path.home() / ".qazterion" / "keystore.dat"
+    from qz_paths import data_dir
+
+    primary = data_dir() / "keystore.dat"
+    if primary.is_file() or os.environ.get("QAZTERION_DATA_DIR") or sys.platform != "win32":
+        return primary
+    # Older desktop builds kept their keystore under %APPDATA%.
+    appdata_base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    legacy = Path(appdata_base) / "qazterion-desktop" / "backend-data" / "keystore.dat"
+    return legacy if legacy.is_file() else primary
 
 
 class _DpapiCipher:
@@ -185,6 +177,7 @@ class KeyStore:
             self._cipher = _FernetCipher(self.path.with_suffix(".keyfile"))
         else:
             raise ValueError(f"Unknown keystore backend: {backend!r}")
+        self._plain_cache: dict[str, str] = {}
         self._data: dict = self._load_raw()
         self._hydrate_provider_families()
 
@@ -231,8 +224,10 @@ class KeyStore:
         return loaded
 
     def _save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, indent=2), encoding="utf-8")
+        from qz_paths import atomic_write_text
+
+        # Atomic replace: a crash mid-write never leaves a truncated keystore.
+        atomic_write_text(self.path, json.dumps(self._data, indent=2))
         if os.name != "nt":
             os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
 
@@ -240,18 +235,35 @@ class KeyStore:
         return base64.b64encode(self._cipher.encrypt(value.encode("utf-8"))).decode("ascii")
 
     def _decrypt_str(self, blob: str) -> str:
-        return self._cipher.decrypt(base64.b64decode(blob)).decode("utf-8")
+        cached = self._plain_cache.get(blob)
+        if cached is None:
+            cached = self._cipher.decrypt(base64.b64decode(blob)).decode("utf-8")
+            self._plain_cache[blob] = cached
+        return cached
 
     # ---- provider keys -----------------------------------------------------
 
     @staticmethod
     def _family_for(provider: str) -> str:
-        family = PROVIDER_FAMILIES.get(provider.lower())
-        if not family:
+        """Key family (env-var prefix) for a provider: built-in, registered, or from the catalog."""
+        pid = str(provider or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,40}", pid):
+            raise UnsupportedProviderError(f"Invalid provider id '{provider}'.")
+        family = PROVIDER_FAMILIES.get(pid)
+        if family:
+            return family
+        try:
+            from qz_providers.catalog import ProviderCatalog
+
+            spec = ProviderCatalog().provider(pid)
+        except Exception:
+            spec = None
+        if spec is None:
             raise UnsupportedProviderError(
-                f"Unsupported provider '{provider}'. Supported providers: {', '.join(SUPPORTED_PROVIDERS)}."
+                f"Unknown provider '{provider}'. Supported providers: {', '.join(SUPPORTED_PROVIDERS)}. "
+                "Add new providers to providers.yaml or register them as a custom provider first."
             )
-        return family
+        return register_provider_family(pid, spec.key_prefix)
 
     def set_key(self, provider: str, index: int, value: str, enabled: bool = True) -> str:
         """Store (or replace) one numbered key for a provider. Returns the
@@ -268,6 +280,7 @@ class KeyStore:
             "family": family,
             "index": index,
             "blob": self._encrypt_str(value.strip()),
+            "masked": mask_key(value.strip()),
             "enabled": bool(enabled),
         }
         self._save()
@@ -311,19 +324,23 @@ class KeyStore:
                 continue
             if provider and entry["provider"] != provider.lower():
                 continue
-            try:
-                decrypted = self._decrypt_str(entry["blob"])
-            except Exception:
-                decrypted = ""
-            if not decrypted or not decrypted.strip():
-                continue
+            masked = entry.get("masked")
+            if not masked:
+                # Entries written by older versions have no stored mask.
+                try:
+                    decrypted = self._decrypt_str(entry["blob"])
+                except Exception:
+                    decrypted = ""
+                if not decrypted.strip():
+                    continue
+                masked = mask_key(decrypted)
             results.append(
                 KeyEntry(
                     provider=entry["provider"],
                     family=entry.get("family") or self._family_for(entry["provider"]),
                     index=int(entry.get("index") or 1),
                     env_name=env_name,
-                    masked_value=mask_key(decrypted),
+                    masked_value=masked,
                     enabled=bool(entry.get("enabled", True)),
                 )
             )
@@ -331,49 +348,6 @@ class KeyStore:
 
     def configured_providers(self) -> list[str]:
         return sorted({entry.provider for entry in self.list_entries() if entry.enabled})
-
-    # ---- master key -----------------------------------------------------
-
-    def set_master_key(self, value: str) -> None:
-        if not value or not value.strip():
-            raise ValueError("A master key value is required.")
-        self._data["master_key"] = {"blob": self._encrypt_str(value.strip())}
-        self._save()
-
-    def get_master_key(self) -> str | None:
-        entry = self._data.get("master_key")
-        return self._decrypt_str(entry["blob"]) if entry else None
-
-    def has_master_key(self) -> bool:
-        return self._data.get("master_key") is not None
-
-    # ---- consumption by generate_config.py / the proxy -------------------
-
-    def enabled_key_groups(self) -> dict[str, list[str]]:
-        """Same shape as `generate_config.discover_key_groups`, sourced from
-        enabled keystore entries instead of a plaintext `.env` file."""
-        groups: dict[str, list[str]] = {}
-        for entry in self.list_entries():
-            if not entry.enabled:
-                continue
-            groups.setdefault(entry.family, []).append(entry.env_name)
-        for family in groups:
-            groups[family].sort(key=lambda name: int(name.rsplit("_", 1)[1]))
-        return groups
-
-    def enabled_env(self) -> dict[str, str]:
-        """Decrypted env vars for enabled keys plus the master key, suitable
-        for passing directly to the LiteLLM proxy subprocess. Never written
-        to disk by the caller — the backend supplies only what LiteLLM
-        needs, in memory, for the lifetime of that process."""
-        env: dict[str, str] = {}
-        for env_name, entry in self._data.get("entries", {}).items():
-            if entry["enabled"]:
-                env[env_name] = self._decrypt_str(entry["blob"])
-        master = self.get_master_key()
-        if master:
-            env[_MASTER_ENTRY_NAME] = master
-        return env
 
     # ---- custom / newly-released providers --------------------------------
 
@@ -389,6 +363,7 @@ class KeyStore:
         p_id = provider.lower().strip()
         if not p_id:
             raise ValueError("Provider id is required.")
+        self._reload()
         family_name = register_provider_family(p_id, family)
         record = {
             "provider_id": p_id,

@@ -35,10 +35,11 @@ Unlike tools locked to a single AI provider, Qazterion is built around **automat
 │                                                                      │
 │                    AI SOFTWARE ENGINEERING AGENT                     │
 ╰──────────────────────────────────────────────────────────────────────╯
-  Qazterion v2.0.0
-  Model      gemini-3.6-flash
+  Qazterion v2.3.0
+  Coder      gemini/gemini-flash-latest (+4 fallback)
+  Accounts   4 key(s) across gemini, groq, openrouter
   Directory  D:\Projects\my-app
-  Git        main ✓
+  Git        main
 ────────────────────────────────────────────────────────────────────────
 ```
 
@@ -61,11 +62,11 @@ Unlike tools locked to a single AI provider, Qazterion is built around **automat
 - **Interactive REPL**: Claude Code-style terminal with command history, autocompletion, status trees, and syntax-highlighted diffs.
 - **Autonomous Execution Loop**:
   `Understand` → `Plan` → `Permission Approval` → `Inspect` → `Act` → `Observe` → `Test` → `Self-Repair` → `Git Checkpoint`.
-- **Multi-Provider Key Rotation & Failover**: Automatic failover across Google Gemini, Groq, Mistral, DeepSeek, and OpenRouter with physical key injection, concurrency limits, and immediate 429 rotation.
+- **Multi-Provider, Multi-Account Routing**: The agent asks for a *role* (coder, planner, fast, reasoner, classify); an in-process gateway picks a provider, model and API key, rotates keys on rate limits, disables rejected keys, benches retired models, and fails over to other providers. No proxy server, no Docker.
 - **Instruction Hierarchy & Trust Boundaries**: Immutable system prompt at index 0; external tool results, repository reads, and summaries are sandboxed as untrusted user content.
 - **Hardware-Level Encryption & Secret Isolation**: API keys encrypted at rest via Windows DPAPI (`CryptProtectData`) on Windows and Fernet on Unix; credentials accessed strictly in-memory and excluded from global `os.environ`.
 - **Subprocess Environment Sanitization**: Child processes, host tools, and Git commands execute in sanitized environments stripped of sensitive host tokens.
-- **SQLite Persistence & Telemetry**: Comprehensive persistent tracking of sessions, tasks, events, checkpoints, model calls, token consumption, and latency metrics in `%LOCALAPPDATA%\Qazterion\qazterion.db`.
+- **Local Persistence**: Tasks, events and checkpoints in one SQLite file; usage in a small JSONL log; key/model health in a JSON file — all under `%LOCALAPPDATA%\Qazterion\`, never inside your project.
 
 ---
 
@@ -87,24 +88,20 @@ pip install -e .
 
 ### 2. Configure API Keys
 
-Add your provider keys to the encrypted keystore:
+Either store keys in the encrypted keystore (the key is typed at a hidden prompt, never on the command line):
 
 ```powershell
-# Add Google Gemini Key
-qazterion /keys add gemini 1 AIzaSyYourGeminiKey...
-
-# Add multiple keys for the same provider (auto-failover on rate limits)
-qazterion /keys add gemini 2 AIzaSyYourSecondGeminiKey...
-
-# Add Groq LPU Key (Optional)
-qazterion /keys add groq 1 gsk_yourGroqKey...
+qazterion /keys add gemini        # stored as GEMINI_KEY_1
+qazterion /keys add gemini        # a second account: GEMINI_KEY_2
+qazterion /keys add groq
 ```
 
-Verify your keys and connectivity:
+…or put them in a `.env` file (see `.env.example`): `GEMINI_KEY_1=...`, `GEMINI_KEY_2=...`, `GROQ_KEY_1=...`.
+
+Check them (lists models only — costs no tokens):
 
 ```powershell
-qazterion /keys list
-qazterion /keys test gemini 1
+qazterion /keys test
 qazterion /status
 ```
 
@@ -128,7 +125,8 @@ Inside the Qazterion interactive session or directly from terminal arguments:
 |---|---|
 | `/help` | Display manual of available commands and usage guidelines |
 | `/status` | View provider routing matrix, model health, and telemetry stats |
-| `/keys` \| `/model` | List, add (with masked input), remove, and test provider keys |
+| `/keys` | `list`, `add <provider>` (hidden input), `delete`/`enable`/`disable <provider> <n>`, `test`, `reset` |
+| `/model` | Show roles → models; `/model <role> <provider/model>` to prefer a model; `/model strategy balanced\|priority` |
 | `/diff` \| `/files` | Inspect uncommitted changes and unified colored diffs |
 | `/rollback` \| `/undo` | View recent git checkpoints and revert changes safely |
 | `/history` | Show list of completed autonomous tasks, duration, and token usage |
@@ -186,44 +184,70 @@ Qazterion
 
 ---
 
+## Providers, Keys & Routing
+
+All provider configuration lives in one YAML catalog: built-in defaults in
+`qz_providers/default_providers.yaml`, overridable in `%LOCALAPPDATA%\Qazterion\providers.yaml`.
+
+```yaml
+providers:
+  gemini:
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+    key_prefix: GEMINI_KEY            # keys: GEMINI_KEY_1, GEMINI_KEY_2, ...
+    models:
+      gemini-flash-latest: {context_window: 1048576, tools: true}
+roles:
+  coder: [gemini/gemini-flash-latest, groq/llama-3.3-70b-versatile, mistral/codestral-latest]
+```
+
+* **Adding a provider** = adding a `providers:` entry with an OpenAI-compatible `base_url` (or `/keys` + the desktop app's "custom provider"). No code changes.
+* **Per request**, the gateway walks the role's models in order, skipping disabled providers, models without tool support (when tools are needed), models with no key, and models/keys that are cooling down.
+* **Keys rotate**: `balanced` (default) spreads requests across a provider's healthy keys; `priority` sticks to the first healthy one.
+* **Failures are classified once** and drive the next step: invalid/expired key → key disabled until replaced; rate limit / quota → that key cools down *for that model* (Retry-After honoured); retired model → benched for 6 h; timeouts/5xx → another key, then the next model; everything cooling briefly → wait up to 30 s.
+* Health state is shared between the CLI and the desktop app through `provider_health.json`, so a failing key is not retried by the next process.
+
+---
+
 ## Architecture & Codebase Layout
 
 ```text
 qazterion-agent/
-├── qz_cli/                 # Terminal UI, Claude Code theme, banner, REPL, formatters
-│   ├── app.py              # Main CLI entry point & prompt loop
-│   ├── banner.py           # ASCII header banner & workspace card
-│   ├── formatters.py       # Rich unified diff, plan tree & status tables
-│   └── commands/           # Slash command handlers (/keys, /status, /diff, etc.)
-├── qz_core/                # Pure autonomous core engine
-│   ├── autonomous_loop.py  # End-to-end execution runner
-│   ├── event_bus.py        # Central Pub/Sub event dispatcher
-│   ├── planner.py          # Plan generation & DAG decomposition
-│   ├── classifier.py       # Task complexity & mode analyzer
-│   ├── dag_executor.py     # Hard DAG sequential node executor
-│   ├── client.py           # Multi-provider LiteLLM client & key rotation
-│   └── git_ops.py          # Atomic git checkpoints & rollbacks
-├── qz_storage/             # Persistent SQLite database engine
-│   └── db.py               # Sessions, tasks, events, checkpoints, telemetry
-├── qz_security/             # Security sandbox, path traversal & rules engine
-├── qz_indexer.py            # Incremental AST parser & symbol dependency graph
-├── qz_context.py            # Hybrid retrieval (exact, symbol, semantic) & budgets
-├── qz_keystore.py           # OS DPAPI hardware encryption for secrets
-├── qz_repair.py              # Self-healing diagnostic repair loop
-└── qz_tools.py               # File system, diffing, and subprocess tools
+├── qz_cli/                  # Terminal UI: REPL, banner, formatters, slash commands
+├── qz_core/
+│   ├── autonomous_loop.py   # Task pipeline: env → plan → approval → DAG → execute
+│   ├── planner.py           # Plan, architecture, subtask DAG
+│   ├── classifier.py        # Task mode / complexity
+│   ├── dag_executor.py      # Per-subtask tool loop, validation gate, repair
+│   ├── executor.py          # request_completion(), system prompt, test baseline
+│   └── client.py            # OpenAI-style facade over the provider gateway
+├── qz_providers/            # Multi-provider access
+│   ├── default_providers.yaml  # Providers, models, roles (single source of truth)
+│   ├── catalog.py           # Loads/merges/edits the catalog
+│   ├── keys.py              # Keys per provider (keystore + environment)
+│   ├── health.py            # Key / model cooldowns (persisted)
+│   ├── gateway.py           # Role → provider/model/key selection with failover
+│   └── adapters/            # OpenAI-compatible + OpenRouter wire protocols
+├── qz_tasks/                # SQLite task/event/checkpoint store
+├── qz_security/             # Command risk, path guard, approvals, secret redaction
+├── qz_sandbox/              # Host command execution (scrubbed env, timeouts)
+├── qz_validation/           # Tests/lint/typecheck/build/security gate
+├── qz_recovery/             # Resume and safe checkpoint rollback
+├── qz_keystore.py           # DPAPI (Windows) / Fernet encrypted key storage
+├── qz_tools.py              # File, patch, command and git tools for the agent
+└── qz_desktop_bridge.py     # JSON-RPC backend for the desktop app
 ```
 
 ---
 
 ## Testing
 
-Run the automated test suite across all 38 test modules:
-
 ```powershell
-pytest -v
+pip install -e ".[dev]"
+pytest
 ```
 
-Full suite results: **306 passed, 1 skipped (Docker daemon detection), 0 failed**.
+The suite is hermetic: it never reads your real keys or calls real providers (provider HTTP is
+simulated with a local server and scripted adapters). Docker is not used or required.
 
 For detailed audit history, threat models, and architectural specifications, refer to [USER_GUIDE.md](USER_GUIDE.md) and [SECURITY.md](SECURITY.md).
 
@@ -241,7 +265,7 @@ Yes. Qazterion is released under the MIT License and is free to self-host. You o
 Qazterion is not locked to one AI provider. It supports Google Gemini, Groq, Mistral, DeepSeek, and OpenRouter simultaneously, with automatic key rotation and failover across multiple keys of the same provider — so a single rate limit never blocks your workflow.
 
 **Can I use multiple API keys from the same provider (e.g. two Gemini keys)?**
-Yes — Qazterion is built for this. Add as many keys as you want per provider family (`qazterion /keys add gemini 1 ...`, `qazterion /keys add gemini 2 ...`) and the router automatically load-balances and fails over between them.
+Yes — Qazterion is built for this. Run `qazterion /keys add gemini` once per account (or set `GEMINI_KEY_1`, `GEMINI_KEY_2`, … in `.env`); requests rotate across healthy keys and skip ones that are rate limited or rejected.
 
 **Does Qazterion work on Windows, macOS, and Linux?**
 Yes. It's tested via CI on `windows-latest` and `ubuntu-latest` across Python 3.10–3.13.

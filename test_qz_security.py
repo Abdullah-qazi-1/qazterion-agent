@@ -108,14 +108,91 @@ class GatewayBlockingTests(unittest.TestCase):
         self.assertIn("Denied by security policy", result)
         run.assert_not_called()
 
-    def test_medium_risk_run_command_is_allowed_when_headless(self):
+    def test_medium_risk_run_command_is_denied_when_nobody_can_approve(self):
+        with patch("qz_sandbox.backend.subprocess.Popen") as popen_mock:
+            result = qz_tools.run_command("pip install pytest")
+        self.assertIn("Denied by security policy (MEDIUM)", result)
+        self.assertIn("approval required", result)
+        popen_mock.assert_not_called()
+
+    def test_medium_risk_headless_opt_in_allows_the_command(self):
         from qz_sandbox.manager import SandboxManager
 
-        with patch("qz_tools.get_manager", return_value=SandboxManager(docker_available=False)):
-            with patch("qz_sandbox.backend.subprocess.Popen") as popen_mock:
-                popen_mock.return_value.communicate.return_value = ("ok", "")
-                popen_mock.return_value.returncode = 0
-                result = qz_tools.run_command("pip install pytest")
+        with patch.dict("os.environ", {"QAZTERION_HEADLESS_MEDIUM": "allow"}), \
+             patch("qz_tools.get_manager", return_value=SandboxManager()), \
+             patch("qz_sandbox.backend.subprocess.Popen") as popen_mock:
+            popen_mock.return_value.communicate.return_value = ("ok", "")
+            popen_mock.return_value.returncode = 0
+            result = qz_tools.run_command("pip install pytest")
         self.assertIn("exit_code=0", result)
-        self.assertNotIn("Denied by security policy", result)
         popen_mock.assert_called()
+
+    def test_ask_handler_must_return_an_explicit_approval(self):
+        from qz_security import gateway
+
+        for answer, allowed in (("deny", False), (None, False), (True, True), ("allow", True)):
+            gateway.configure(ask_handler=lambda *_a, value=answer: value)
+            try:
+                with patch("qz_sandbox.backend.subprocess.Popen") as popen_mock:
+                    popen_mock.return_value.communicate.return_value = ("ok", "")
+                    popen_mock.return_value.returncode = 0
+                    result = qz_tools.run_command("pip install pytest")
+            finally:
+                gateway.configure(ask_handler=None)
+            self.assertEqual("Denied by security policy" not in result, allowed, (answer, result))
+
+    def test_crashing_ask_handler_denies(self):
+        from qz_security import gateway
+
+        def broken(*_args):
+            raise RuntimeError("prompt crashed")
+
+        gateway.configure(ask_handler=broken)
+        try:
+            result = qz_tools.run_command("pip install pytest")
+        finally:
+            gateway.configure(ask_handler=None)
+        self.assertIn("Denied by security policy", result)
+
+
+class GitAndInlineCodeRiskTests(unittest.TestCase):
+    def test_destructive_git_commands_are_high_risk(self):
+        for command in (
+            "git reset --hard HEAD~1",
+            "git clean -fdx",
+            "git checkout -- .",
+            "git checkout .",
+            "git checkout HEAD -- src/app.py",
+            "git restore src/app.py",
+            "git stash drop",
+            "git branch -D feature",
+            "git push --force origin main",
+            "git rebase -i HEAD~3",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(classify_command(command)[0], RiskLevel.HIGH)
+
+    def test_safe_git_and_package_commands_are_not_over_blocked(self):
+        self.assertEqual(classify_command("git status")[0], RiskLevel.LOW)
+        self.assertEqual(classify_command("git diff HEAD")[0], RiskLevel.LOW)
+        self.assertEqual(classify_command("git restore --staged app.py")[0], RiskLevel.LOW)
+        self.assertEqual(classify_command("git checkout -b feature")[0], RiskLevel.LOW)
+        self.assertEqual(classify_command("pip install requests")[0], RiskLevel.MEDIUM)
+        self.assertEqual(classify_command("pip install python-dotenv")[0], RiskLevel.MEDIUM)
+        self.assertEqual(classify_command("python -m pytest tests/test_requests.py")[0], RiskLevel.LOW)
+
+    def test_inline_code_is_judged_by_what_it_does(self):
+        self.assertEqual(classify_command('python -c "print(1 + 1)"')[0], RiskLevel.LOW)
+        self.assertEqual(classify_command('python -c "from calc import add; assert add(1, 2) == 3"')[0], RiskLevel.LOW)
+        self.assertEqual(classify_command('python -c "import urllib.request; urllib.request.urlopen(1)"')[0], RiskLevel.HIGH)
+        self.assertEqual(classify_command('python -c "import shutil; shutil.rmtree(\'x\')"')[0], RiskLevel.HIGH)
+        self.assertEqual(classify_command('node -e "require(\'child_process\').exec(\'x\')"')[0], RiskLevel.HIGH)
+
+    def test_home_and_dotenv_paths_are_high_risk(self):
+        self.assertEqual(classify_command("type .env")[0], RiskLevel.HIGH)
+        self.assertEqual(classify_command("cat ~/.ssh/id_rsa")[0], RiskLevel.HIGH)
+        self.assertEqual(classify_command("Get-Content $HOME\\secrets.txt")[0], RiskLevel.HIGH)
+
+
+if __name__ == "__main__":
+    unittest.main()

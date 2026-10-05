@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
+
+from qz_sandbox.backend import NO_WINDOW
 import sys
 import time
 from dataclasses import asdict, dataclass, field
@@ -12,7 +13,6 @@ from pathlib import Path
 from typing import Any
 
 from qz_keystore import KeyStore
-from qz_sandbox.manager import probe_docker
 
 
 @dataclass
@@ -62,7 +62,7 @@ def check_system_health(workspace: str | Path | None = None, keystore: KeyStore 
     git_path = shutil.which("git")
     if git_path:
         try:
-            res = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=3, check=False)
+            res = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=3, check=False, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW)
             git_ver = res.stdout.strip() if res.returncode == 0 else "git detected"
             components["git"] = ComponentHealth(
                 name="Git Version Control",
@@ -89,26 +89,15 @@ def check_system_health(workspace: str | Path | None = None, keystore: KeyStore 
         )
         advisories.append("Git is required for atomic checkpoints, diff history, and recovery.")
 
-    # 3. Docker Sandbox
-    docker_available = probe_docker()
-    if docker_available:
-        components["docker"] = ComponentHealth(
-            name="Docker Sandbox Isolation",
-            status="healthy",
-            available=True,
-            details="Docker daemon is running. Container isolation active.",
-            metadata={"isolation": "CONTAINER"},
-        )
-    else:
-        components["docker"] = ComponentHealth(
-            name="Docker Sandbox Isolation",
-            status="advisory",
-            available=False,
-            details="Docker daemon unreachable. Restricted host fallback active.",
-            action_needed="Start Docker Desktop to enable full containerized sandbox isolation.",
-            metadata={"isolation": "UNSANDBOXED_HOST_FALLBACK"},
-        )
-        advisories.append("Docker is not running; commands will run in restricted host mode.")
+    # 3. Command execution (host process; no Docker or VM required)
+    components["execution"] = ComponentHealth(
+        name="Command Execution",
+        status="healthy",
+        available=True,
+        details="Commands run on this machine inside the workspace, with secrets removed from the "
+                "environment, timeouts, and approval required for risky commands.",
+        metadata={"isolation": "host"},
+    )
 
     # 4. OS Keystore
     ks = keystore or KeyStore()
@@ -121,17 +110,27 @@ def check_system_health(workspace: str | Path | None = None, keystore: KeyStore 
         metadata={"backend": ks_backend},
     )
 
-    # 5. Configured Providers & Keys
-    key_groups = ks.enabled_key_groups()
-    configured_count = sum(len(v) for v in key_groups.values())
+    # 5. Configured providers & keys (keystore and environment)
+    try:
+        from qz_providers.catalog import ProviderCatalog
+        from qz_providers.keys import KeySource
+
+        catalog = ProviderCatalog()
+        source = KeySource(catalog, keystore_factory=lambda: ks)
+        per_provider = {p: len(source.keys_for(p)) for p in catalog.providers}
+    except Exception as error:
+        per_provider = {}
+        advisories.append(f"Provider configuration could not be loaded: {error}")
+    per_provider = {p: n for p, n in per_provider.items() if n}
+    configured_count = sum(per_provider.values())
     if configured_count > 0:
-        providers_list = ", ".join(f"{p} ({len(keys)})" for p, keys in sorted(key_groups.items()))
+        providers_list = ", ".join(f"{p} ({n})" for p, n in sorted(per_provider.items()))
         components["providers"] = ComponentHealth(
             name="LLM Providers & Keys",
             status="healthy",
             available=True,
             details=f"{configured_count} key(s) configured across: {providers_list}",
-            metadata={"configured_count": configured_count, "providers": list(key_groups.keys())},
+            metadata={"configured_count": configured_count, "providers": sorted(per_provider)},
         )
     else:
         components["providers"] = ComponentHealth(
@@ -139,10 +138,10 @@ def check_system_health(workspace: str | Path | None = None, keystore: KeyStore 
             status="advisory",
             available=False,
             details="No API keys have been configured yet.",
-            action_needed="Add at least one free or commercial provider key (e.g. Groq, Gemini, Mistral, OpenRouter).",
+            action_needed="Add at least one provider key (e.g. Groq or Gemini) with /keys add or in the app.",
             metadata={"configured_count": 0},
         )
-        advisories.append("No API keys configured. Set up keys in the Onboarding / API Models screen.")
+        advisories.append("No API keys configured. Add keys with `qazterion /keys add <provider>` or in the app.")
 
     # 6. Workspace check if provided
     if workspace:

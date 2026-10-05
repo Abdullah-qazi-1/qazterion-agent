@@ -6,10 +6,7 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from pathlib import Path
-from typing import Any
 
-from qz_tools import WORKSPACE
 from qz_validation import CheckResult, CheckStatus, ValidationReport
 
 
